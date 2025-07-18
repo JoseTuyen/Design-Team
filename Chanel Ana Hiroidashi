@@ -1,0 +1,702 @@
+using ClosedXML.Excel;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace GetAnguruAna.ChaneruAna
+{
+    public class Chanel
+    {
+        [CommandMethod("ChaneruAna")]
+        public void ChaneruAna()
+        { 
+            Document doc=Application.DocumentManager.MdiActiveDocument;
+            Database dat=doc.Database;
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                PromptSelectionResult promSeRes;
+                List<Extents3d> extArr = new List<Extents3d>();
+                short textColorIndex = 92;
+
+                #region dinh nghia, tao bo loc
+                //bo loc polyline
+                TypedValue[] TypValArrPolylines = new TypedValue[2];
+                TypValArrPolylines.SetValue(new TypedValue((int)DxfCode.Start, "POLYLINE,LWPOLYLINE"), 0);
+                TypValArrPolylines.SetValue(new TypedValue((int)DxfCode.LayerName, "ポリライン"), 1);
+
+                //tao bo loc
+                SelectionFilter selectFil = new SelectionFilter(TypValArrPolylines);
+                #endregion
+
+                #region Loc cac polyline
+                //loc doi tuong polyline co layer nhu tren
+                promSeRes = doc.Editor.GetSelection(selectFil);
+                if (promSeRes.Status == PromptStatus.OK)
+                {
+                    SelectionSet selectSet = promSeRes.Value;
+                    using (Transaction tr1 = doc.TransactionManager.StartTransaction())
+                    {
+                        foreach (SelectedObject selObj in selectSet)
+                        {
+                            Entity poly1 = tr1.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                            if (poly1 != null)
+                            {
+                                extArr.Add(poly1.GeometricExtents);
+                            }
+                        }
+                        tr1.Commit();
+                    }
+                    extArr = extArr.OrderByDescending(l => l.MinPoint.Y).ToList();
+                }
+                #endregion
+
+                List<string> elementCodeArr = new List<string>();
+
+                #region xet cac polyline da duoc sap xep, bat cap cac polyline
+                int iChay = 0;
+
+                while (iChay < extArr.Count - 1)
+                {
+                    if (((extArr[iChay].MinPoint.Y - extArr[iChay + 1].MinPoint.Y) < 400) && iChay<=extArr.Count-2)//cau kien co 2 hinh chieu
+                    {
+                        Point3d minPt1 = extArr[iChay].MinPoint;//min point cua polyline 1
+                        Point3d maxPt1 = extArr[iChay].MaxPoint;//max point cua polyline 1
+                        Point3d minPt2 = extArr[iChay + 1].MinPoint;//min point cua polyline 2
+                        Point3d maxPt2 = extArr[iChay + 1].MaxPoint;//max point cua polyline 2
+
+                        string elementCode = "";//ten cau kien da duoc ma hoa
+
+                        #region lay text ten goi cau kien
+                        //lay text gan voi polyline nhat (ten cua thanh cau kien)
+                        DBText elementName = GetNearestTextToWindow(dat, minPt1, maxPt1, textColorIndex);
+                        string strElementName1 = elementName.TextString;
+                        string strElementName = Regex.Replace(strElementName1, @".+-C", "C");
+                        #endregion
+
+                        //lay duong kinh
+                        #region lay thong tin cac lo trong hinh 1,2
+                        //phan chia theo truong hop LeftToRight1 hay LeftToRight2
+                        string direcTion = GetAnaMuki(minPt1, maxPt1);
+                        double minDiameter1 = 0;
+                        double minDiameter2 = 0;
+                        List<Circle> allCircleList1 = new List<Circle>();//list tat ca duong tron co san va duong tron thay the
+                        List<Circle> allCircleList2 = new List<Circle>();//list tat ca duong tron co san va duong tron thay the
+
+                        # region lay list circle da dieu chinh toa do Y 100
+                        if (direcTion == "LeftToRight")//trai sang phai,luoi quay ra
+                        {
+                            #region hinh ben tren
+                            List<Circle> circleList1;
+                            List<BlockReference> blockList1;//toa do Y dang duoc cong them 100, vao Excel phai dieu chinh lai
+                            GetEntitiesInWindow(dat, minPt1, maxPt1, out circleList1, out blockList1);//lay ket qua
+
+                            //tao duong tron thay the block
+                            List<Circle> convertCircleList1 = new List<Circle>();//list duong tron thay the
+
+                            if (blockList1.Count > 0)
+                            {
+                                foreach (BlockReference blk in blockList1)
+                                {
+                                    using (Transaction tr1 = dat.TransactionManager.StartTransaction())
+                                    {
+                                        Circle resultCircle = CreateCircleFromBlockCircle(blk, tr1);
+                                        convertCircleList1.Add(resultCircle);
+                                        tr1.Commit();
+                                    }
+                                }
+                            }
+                            if (circleList1.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < circleList1.Count; kChay++)
+                                {
+                                    allCircleList1.Add(circleList1[kChay]);
+                                }
+                            }
+                            if (convertCircleList1.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < convertCircleList1.Count; kChay++)
+                                {
+                                    allCircleList1.Add(convertCircleList1[kChay]);
+                                }
+                            }
+                            minDiameter1 = allCircleList1.Min(c => c.Diameter);//tra ve duong kinh nho nhat cua duong tron trong list 1
+                            #endregion
+
+                            #region hinh ben duoi
+                            List<Circle> circleList2;
+                            List<BlockReference> blockList2;//toa do Y dang duoc cong them 100, vao Excel phai dieu chinh lai
+                            GetEntitiesInWindow(dat, minPt2, maxPt2, out circleList2, out blockList2);//lay ket qua
+
+                            //tao duong tron thay the block
+                            List<Circle> convertCircleList2 = new List<Circle>();//list duong tron thay the
+
+                            if (blockList2.Count > 0)
+                            {
+                                foreach (BlockReference blk in blockList2)
+                                {
+                                    using (Transaction tr2 = dat.TransactionManager.StartTransaction())
+                                    {
+                                        Circle resultCircle = CreateCircleFromBlockCircle(blk, tr2);
+                                        convertCircleList2.Add(resultCircle);
+                                        tr2.Commit();
+                                    }
+                                }
+                            }
+                            if (circleList2.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < circleList2.Count; kChay++)
+                                {
+                                    allCircleList2.Add(circleList2[kChay]);
+                                }
+                            }
+                            if (convertCircleList2.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < convertCircleList2.Count; kChay++)
+                                {
+                                    allCircleList2.Add(convertCircleList2[kChay]);
+                                }
+                            }
+                            minDiameter2 = allCircleList2.Min(c => c.Diameter);//tra ve duong kinh nho nhat cua duong tron trong list 2
+
+                            #endregion
+                        }
+                        else //direcTion == "RightToLeft"
+                        {
+                            #region hinh ben tren
+                            List<Circle> circleList1;
+                            List<BlockReference> blockList1;//toa do Y dang duoc cong them 100, vao Excel phai dieu chinh lai
+                            GetEntitiesInWindow(dat, minPt1, maxPt1, out circleList1, out blockList1);//lay ket qua
+
+                            //tao duong tron thay the block
+                            List<Circle> convertCircleList1 = new List<Circle>();//list duong tron thay the
+                            if (blockList1.Count > 0)
+                            {
+                                foreach (BlockReference blk in blockList1)
+                                {
+                                    using (Transaction tr1 = dat.TransactionManager.StartTransaction())
+                                    {
+                                        Circle resultCircle = CreateCircleFromBlockCircle(blk, tr1);
+                                        convertCircleList1.Add(resultCircle);
+                                        tr1.Commit();
+                                    }
+                                }
+                            }
+                            if (circleList1.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < circleList1.Count; kChay++)
+                                {
+                                    allCircleList1.Add(circleList1[kChay]);
+                                }
+                            }
+                            if (convertCircleList1.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < convertCircleList1.Count; kChay++)
+                                {
+                                    allCircleList1.Add(convertCircleList1[kChay]);
+                                }
+                            }
+                            minDiameter1 = allCircleList1.Min(c => c.Diameter);//tra ve duong kinh nho nhat cua duong tron trong list 1
+                            #endregion
+
+                            #region hinh ben duoi
+                            List<Circle> circleList2;
+                            List<BlockReference> blockList2;//toa do Y dang duoc cong them 100, vao Excel phai dieu chinh lai
+                            GetEntitiesInWindow(dat, minPt2, maxPt2, out circleList2, out blockList2);//lay ket qua
+
+                            //tao duong tron thay the block
+                            List<Circle> convertCircleList2 = new List<Circle>();//list duong tron thay the
+                            if (blockList2.Count > 0)
+                            {
+                                foreach (BlockReference blk in blockList2)
+                                {
+                                    using (Transaction tr2 = dat.TransactionManager.StartTransaction())
+                                    {
+                                        Circle resultCircle = CreateCircleFromBlockCircle(blk, tr2);
+                                        convertCircleList2.Add(resultCircle);
+                                        tr2.Commit();
+                                    }
+                                }
+                            }
+                            if (circleList2.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < circleList2.Count; kChay++)
+                                {
+                                    allCircleList2.Add(circleList2[kChay]);
+                                }
+                            }
+                            if (convertCircleList2.Count > 0)
+                            {
+                                for (int kChay = 0; kChay < convertCircleList2.Count; kChay++)
+                                {
+                                    allCircleList2.Add(convertCircleList2[kChay]);
+                                }
+                            }
+                            minDiameter2 = allCircleList2.Min(c => c.Diameter);//tra ve duong kinh nho nhat cua duong tron trong list 2
+                            #endregion
+                        }
+                        #endregion
+                        elementCode = strElementName + "#" + minDiameter1.ToString() + "#" + minDiameter2.ToString();
+
+                        if (direcTion == "LeftToRight")//trai sang phai,luoi quay ra
+                        {
+                            var sortAllCircle1 = allCircleList1//sap xep trai sang phai
+                                .Where(c => c != null) // bỏ null nếu có
+                                .OrderBy(c => c.Center.X)
+                                .ThenBy(c => c.Center.Y)
+                                .ToList();
+                            var sortAllCircle2 = allCircleList2//sap xep trai sang phai
+                                .Where(c => c != null) // bỏ null nếu có
+                                .OrderBy(c => c.Center.X)
+                                .ThenBy(c => c.Center.Y)
+                                .ToList();
+                            #region lay list khoang cach phuong X va phuong Y cua tung circle so voi pMin(x va y tinh theo pMin)
+                            //xet lan luot tung circle trong list sortAllCircle1 va them vao trong elementCode
+                            //truoc moi gia tri khoang cach chieu dai them ki tu A, khoang cach gauge them ki tu B, canh them ki tu C
+                            if (sortAllCircle1.Count > 0)
+                            {
+                                //nhap vi tri lo o bung C
+                                for (int mChay = 0; mChay < sortAllCircle1.Count; mChay++)
+                                {
+                                    double distanceX1 = sortAllCircle1[mChay].Center.X - minPt1.X;
+                                    double distanceY1 = sortAllCircle1[mChay].Center.Y - minPt1.Y;
+                                    string strDisX1 = Math.Round(distanceX1, 1).ToString();
+                                    string strDisY1 = Math.Round(distanceY1, 1).ToString();
+                                    elementCode += "A" + strDisX1 + "B" + strDisY1 + "C1";
+                                }
+                                //nhap vi tri lo o canh C
+                                if (sortAllCircle2.Count > 0)
+                                {
+                                    for (int nChay = 0; nChay < sortAllCircle2.Count; nChay++)
+                                    {
+                                        double distanceX2 = sortAllCircle2[nChay].Center.X - minPt2.X;
+                                        double distanceY2 = sortAllCircle2[nChay].Center.Y - minPt2.Y;
+                                        string strDisX2 = Math.Round(distanceX2, 1).ToString();
+                                        string strDisY2 = Math.Round(distanceY2, 1).ToString();
+                                        elementCode += "A" + strDisX2 + "B" + strDisY2 + "C2";
+                                    }
+                                }
+                                elementCode += "A";
+                            }
+                            #endregion
+                        }
+                        else//phai sang trai,luoi quay vao
+                        {
+                            var sortAllCircle1 = allCircleList1//sap xep trai sang phai
+                                .Where(c => c != null) // bỏ null nếu có
+                                .OrderByDescending(c => c.Center.X)
+                                .ThenBy(c => c.Center.Y)
+                                .ToList();
+                            var sortAllCircle2 = allCircleList2//sap xep trai sang phai
+                                .Where(c => c != null) // bỏ null nếu có
+                                .OrderByDescending(c => c.Center.X)
+                                .ThenBy(c => c.Center.Y)
+                                .ToList();
+                            #region lay list khoang cach phuong X va phuong Y cua tung circle so voi pMin(x thep pMax, y theo pMin)
+                            //xet lan luot tung circle trong list sortAllCircle1 va them vao trong elementCode
+                            //truoc moi gia tri khoang cach chieu dai them ki tu A, khoang cach gauge them ki tu B, canh them ki tu C
+                            if (sortAllCircle1.Count > 0)
+                            {
+                                //nhap vi tri lo o bung C
+                                for (int mChay = 0; mChay < sortAllCircle1.Count; mChay++)
+                                {
+                                    double distanceX1 = maxPt1.X- sortAllCircle1[mChay].Center.X;
+                                    double distanceY1 = sortAllCircle1[mChay].Center.Y- minPt1.Y;
+                                    string strDisX1 = Math.Round(distanceX1, 1).ToString();
+                                    string strDisY1 = Math.Round(distanceY1, 1).ToString();
+                                    elementCode += "A" + strDisX1 + "B" + strDisY1 + "C1";
+                                }
+                                //nhap vi tri lo o canh C
+                                if (sortAllCircle2.Count > 0)
+                                {
+                                    for (int nChay = 0; nChay < sortAllCircle2.Count; nChay++)//ca x va y tinh theo pMax
+                                    {
+                                        double distanceX2 = maxPt2.X- sortAllCircle2[nChay].Center.X;
+                                        double distanceY2 = maxPt2.Y - sortAllCircle2[nChay].Center.Y;
+                                        string strDisX2 = Math.Round(distanceX2, 1).ToString();
+                                        string strDisY2 = Math.Round(distanceY2, 1).ToString();
+                                        elementCode += "A" + strDisX2 + "B" + strDisY2 + "C2";
+                                    }
+                                }
+                                elementCode += "A";
+                            }
+                            #endregion
+                        }
+                        #endregion
+                        elementCodeArr.Add(elementCode);
+                        iChay += 2;//chuyen sang vong moi
+                    }
+                    else//cau kien chi co 1 mat cat
+                    {
+                        Point3d minPt1 = extArr[iChay].MinPoint;//min point cua polyline 1
+                        Point3d maxPt1 = extArr[iChay].MaxPoint;//max point cua polyline 1
+
+                        string elementCode = "";//ten cau kien da duoc ma hoa
+
+                        #region lay text ten goi cau kien
+                        //lay text gan voi polyline nhat (ten cua thanh cau kien)
+                        DBText elementName = GetNearestTextToWindow(dat, minPt1, maxPt1, textColorIndex);
+                        string strElementName1 = elementName.TextString;
+                        string strElementName = Regex.Replace(strElementName1, @".+-C", "C");
+                        #endregion
+
+                        #region lay duong kinh
+                        List<Circle> circleList1;
+                        List<BlockReference> blockList1;//toa do Y dang duoc cong them 100, vao Excel phai dieu chinh lai
+                        GetEntitiesInWindow(dat, minPt1, maxPt1, out circleList1, out blockList1);//lay ket qua
+
+                        //tao duong tron thay the block
+                        List<Circle> convertCircleList1 = new List<Circle>();//list duong tron thay the
+                        List<Circle> allCircleList1 = new List<Circle>();//list tat ca duong tron co san va duong tron thay the
+                        string direcTion = GetAnaMuki(minPt1, maxPt1);
+
+                        #region convert block thanh circle
+                        if (direcTion == "LeftToRight")//trai sang phai,luoi quay ra
+                        {
+                            if (blockList1.Count > 0)
+                            {
+                                foreach (BlockReference blk in blockList1)
+                                {
+                                    using (Transaction tr1 = dat.TransactionManager.StartTransaction())
+                                    {
+                                        Circle resultCircle = CreateCircleFromBlockCircle(blk, tr1);
+                                        convertCircleList1.Add(resultCircle);
+                                        tr1.Commit();
+                                    }
+                                }
+                            }
+                        }
+                        else//phai sang trai,luoi quay vao
+                        {
+                            if (blockList1.Count > 0)
+                            {
+                                foreach (BlockReference blk in blockList1)
+                                {
+                                    using (Transaction tr1 = dat.TransactionManager.StartTransaction())
+                                    {
+                                        Circle resultCircle = CreateCircleFromBlockCircle(blk, tr1);
+                                        convertCircleList1.Add(resultCircle);
+                                        tr1.Commit();
+                                    }
+                                }
+                            }
+                        }
+                        #endregion
+
+                        if (circleList1.Count > 0)
+                        {
+                            for (int kChay = 0; kChay < circleList1.Count; kChay++)
+                            {
+                                allCircleList1.Add(circleList1[kChay]);
+                            }
+                        }
+                        if (convertCircleList1.Count > 0)
+                        {
+                            for (int kChay = 0; kChay < convertCircleList1.Count; kChay++)
+                            {
+                                allCircleList1.Add(convertCircleList1[kChay]);
+                            }
+                        }
+                        double minDiameter1 = allCircleList1.Min(c => c.Diameter);//tra ve duong kinh nho nhat cua duong tron trong list 1
+                        #endregion
+                        elementCode = strElementName + "#" + minDiameter1.ToString();
+
+                        #region lay thong tin cac lo 
+                        //phan chia theo truong hop LeftToRight hay RightToLeft
+                        if (direcTion == "LeftToRight")//trai sang phai,luoi quay ra
+                        {
+                            var sortAllCircle1 = allCircleList1//sap xep trai sang phai
+                                .Where(c => c != null) // bỏ null nếu có
+                                .OrderBy(c => c.Center.X)
+                                .ThenBy(c => c.Center.Y)
+                                .ToList();
+                            #region lay list khoang cach phuong X va phuong Y cua tung circle so voi pMin(x va y tinh theo pMin)
+                            //xet lan luot tung circle trong list sortAllCircle1 va them vao trong elementCode
+                            //truoc moi gia tri khoang cach chieu dai them ki tu A, khoang cach gauge them ki tu B, canh them ki tu C
+                            if (sortAllCircle1.Count > 0)
+                            {
+                                //nhap vi tri lo o bung C
+                                for (int mChay = 0; mChay < sortAllCircle1.Count; mChay++)
+                                {
+                                    double distanceX1 = sortAllCircle1[mChay].Center.X - minPt1.X;
+                                    double distanceY1 = sortAllCircle1[mChay].Center.Y - minPt1.Y;
+                                    string strDisX1 = Math.Round(distanceX1, 1).ToString();
+                                    string strDisY1 = Math.Round(distanceY1, 1).ToString();
+                                    elementCode += "A" + strDisX1 + "B" + strDisY1 + "C1";
+                                }
+                                elementCode += "A";
+                            }
+                            #endregion
+                        }
+                        else//trai sang phai,luoi quay vao
+                        {
+                            var sortAllCircle1 = allCircleList1//sap xep trai sang phai
+                                .Where(c => c != null) // bỏ null nếu có
+                                .OrderByDescending(c => c.Center.X)
+                                .ThenBy(c => c.Center.Y)
+                                .ToList();
+                            #region lay list khoang cach phuong X va phuong Y cua tung circle so voi pMin(x thep pMax, y theo pMin)
+                            //xet lan luot tung circle trong list sortAllCircle1 va them vao trong elementCode
+                            //truoc moi gia tri khoang cach chieu dai them ki tu A, khoang cach gauge them ki tu B, canh them ki tu C
+                            if (sortAllCircle1.Count > 0)
+                            {
+                                //nhap vi tri lo o bung C
+                                for (int mChay = 0; mChay < sortAllCircle1.Count; mChay++)
+                                {
+                                    double distanceX1 = maxPt1.X- sortAllCircle1[mChay].Center.X;
+                                    double distanceY1 = sortAllCircle1[mChay].Center.Y-minPt1.Y;
+                                    string strDisX1 = Math.Round(distanceX1, 1).ToString();
+                                    string strDisY1 = Math.Round(distanceY1, 1).ToString();
+                                    elementCode += "A" + strDisX1 + "B" + strDisY1 + "C1";
+                                }
+                                elementCode += "A";
+                            }
+                            #endregion
+                        }
+                        #endregion
+
+                        elementCodeArr.Add(elementCode);
+                        iChay += 1;//chuyen sang vong moi
+                    }
+                }
+                #endregion
+
+                #region xuat excel
+                using (var workbook = new XLWorkbook())
+                {
+                    var worksheet1 = workbook.Worksheets.Add("チャネル孔データ");
+                    for (int iHang = 1; iHang <= elementCodeArr.Count; iHang++)
+                    {
+                        worksheet1.Cell(iHang, 1).Value = elementCodeArr[iHang - 1];
+                    }
+                    string filePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "チャネル孔.xlsx");//tao path luu file
+                    workbook.SaveAs(filePath);//luu file excel
+                    OpenExcelFile(filePath);//mo file excel
+                }
+                #endregion
+                tr.Commit();
+            }
+        }
+
+        #region Ham dung chung
+        //lay text nam gan polyline nhat, duoc gio han boi 2 diem min/max
+        public DBText GetNearestTextToWindow(Database db, Point3d pMin, Point3d pMax, short colorIndex)
+        {
+            DBText nearestText = null;
+            double minYDiff = double.MaxValue;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                // Tính vùng mở rộng mỗi chiều 2000 đơn vị
+                double expand = 1000;
+
+                Point3d extMin = new Point3d(pMin.X - expand, pMin.Y - expand, 0);
+                Point3d extMax = new Point3d(pMax.X + expand, pMax.Y + expand, 0);
+
+                double centerY = (extMin.Y + extMax.Y) / 2;//toa do Y cua trong tam window
+
+                // Lấy không gian hiện hành
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
+
+                foreach (ObjectId objId in btr)
+                {
+                    Entity ent = tr.GetObject(objId, OpenMode.ForRead) as Entity;
+                    DBText text = ent as DBText;
+                    if (text == null) continue;
+
+                    // Kiểm tra màu
+                    if (text.Color.ColorIndex != colorIndex)
+                        continue;
+
+                    Point3d pos = text.Position;
+
+                    // Kiểm tra text có nằm trong vùng mở rộng không
+                    if (pos.X < extMin.X || pos.X > extMax.X || pos.Y < extMin.Y || pos.Y > extMax.Y)
+                        continue;
+
+                    double yDiff = Math.Abs(pos.Y - centerY);// So sánh khoảng cách theo trục Y
+
+                    if (yDiff < minYDiff)
+                    {
+                        minYDiff = yDiff;
+                        nearestText = text;
+                    }
+                }
+                tr.Commit();
+            }
+            return nearestText;
+        }
+
+        //lay cac circle va block trong mot window
+        public void GetEntitiesInWindow(Database db, Point3d pMin, Point3d pMax,
+        out List<Circle> circles, out List<BlockReference> blocks)
+        {
+            circles = new List<Circle>();
+            blocks = new List<BlockReference>();
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                // Khởi tạo bộ chọn
+                Editor ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+                // Lựa chọn đối tượng trong vùng window giữa 2 điểm
+                PromptSelectionResult selRes = ed.SelectWindow(pMin, pMax);
+
+                if (selRes.Status != PromptStatus.OK)
+                    return;
+
+                SelectionSet selSet = selRes.Value;
+
+                foreach (SelectedObject selObj in selSet)
+                {
+                    if (selObj == null) continue;
+
+                    Entity ent = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    if (ent is Circle circle)
+                        circles.Add(circle);
+                    else if (ent is BlockReference blockRef)
+                        blocks.Add(blockRef);
+                }
+
+                tr.Commit();
+            }
+        }
+
+        //tao ra duong tron thay the block nocpin
+        public Circle CreateCircleFromBlockCircle(BlockReference blockRef, Transaction tr)
+        {
+            if (blockRef == null || tr == null)
+                return null;
+
+            BlockTableRecord blockDef = tr.GetObject(blockRef.BlockTableRecord, OpenMode.ForRead) as BlockTableRecord;
+            if (blockDef == null)
+                return null;
+
+            foreach (ObjectId objId in blockDef)
+            {
+                Entity ent = tr.GetObject(objId, OpenMode.ForRead) as Entity;
+
+                if (ent is Circle circle)
+                {
+                    double radius = circle.Radius; // dùng radius để khởi tạo
+                    Point3d center1 = new Point3d();
+                    center1 = new Point3d(blockRef.Position.X, blockRef.Position.Y + 100, 0);
+
+                    // Tạo đường tròn mới với tâm là điểm đặt block
+                    Circle newCircle = new Circle
+                    {
+                        //Center = blockRef.Position,
+                        Center = center1,
+                        Radius = radius,
+                        Normal = Vector3d.ZAxis,
+                        Thickness = 0
+                    };
+                    return newCircle;
+                }
+            }
+            return null;
+        }
+
+        //tao ra ham nhan dien doc lo tu trai sang phai hay nguoc lai
+        public string GetAnaMuki(Point3d minPt, Point3d maxPt)
+        {
+            string direcTion = "LeftToRight1";//mac dinh la trai sang phai,canh quay ra
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            #region dinh nghia bo loc va tao bo loc
+            TypedValue[] TypValArrLines = new TypedValue[1];
+            TypValArrLines.SetValue(new TypedValue((int)DxfCode.Start, "LINE, LWLINE, POLYLINE, LWPOLYLINE"), 0);
+
+            SelectionFilter SelFilLines = new SelectionFilter(TypValArrLines);
+            #endregion
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                // 1. Tạo cửa sổ chọn (WindowSelection), mo rong window ra moi ben 20mm
+                Point3d minPt1 = new Point3d(minPt.X - 20, minPt.Y - 20, 0);
+                Point3d maxPt1 = new Point3d(maxPt.X + 20, maxPt.Y + 20, 0);
+                PromptSelectionResult selRes = ed.SelectCrossingWindow(minPt1, maxPt1);
+                if (selRes.Status != PromptStatus.OK)
+                    return direcTion;
+
+                // 2. Lọc các đối tượng LINE và LWPOLYLINE
+                SelectionSet selSet = selRes.Value;
+                List<Line> validLines = new List<Line>();
+                double windowLength = Math.Abs(maxPt.X - minPt.X);
+
+                foreach (SelectedObject obj in selSet)
+                {
+                    if (obj == null) continue;
+
+                    Entity ent = tr.GetObject(obj.ObjectId, OpenMode.ForRead) as Entity;
+                    if (ent is Line line)
+                    {
+                        double length = line.Length;
+
+                        // 3. Kiểm tra chiều dài trong ngưỡng
+                        if (length >= windowLength - 10 && length <= windowLength + 1 && line.StartPoint.Y != minPt.Y && line.StartPoint.Y != maxPt.Y)//sai so la 1mm
+                        {
+                            validLines.Add(line);
+                        }
+                    }
+                }
+
+                if (validLines.Count == 0)
+                {
+                    return direcTion;
+                }
+
+                // 4. Lấy đường đầu tiên
+                Line selectedLine = validLines[0];
+
+                // 5. Kiểm tra linetype
+                string lineType = selectedLine.Linetype.ToLower();
+                bool isContinuous = lineType == "continuous";
+
+                // 6. Xác định direction
+                if (isContinuous)
+                {
+                    direcTion = "LeftToRight";//chieu trai sang phai,canh quay ra
+                }
+                else
+                {
+                    direcTion = "RightToLeft";//chieu phai sang trai,canh quay vao
+                }
+                tr.Commit();
+            }
+            return direcTion;
+        }
+
+        //open excel file
+        private static void OpenExcelFile(string filePath)
+        {
+            try
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = filePath,
+                    UseShellExecute = true // Sử dụng shell mặc định của hệ điều hành để mở file
+                };
+                Process.Start(startInfo);
+            }
+            catch (System.Exception ex)
+            {
+                Console.WriteLine("Cannot open file excel: " + ex.Message);
+            }
+        }
+        #endregion
+    }
+}
