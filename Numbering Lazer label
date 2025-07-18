@@ -1,0 +1,326 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+using System.Text.RegularExpressions;
+
+namespace LazerLabel.Numbering
+{
+    public class Numbering
+    {
+        [CommandMethod("LL2")]
+        public void LazerNumbering()
+        { 
+            Document doc=Application.DocumentManager.MdiActiveDocument;
+            Database dat=doc.Database;
+            Editor ed=doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<(Polyline pl, Extents3d ext)> plInfos = new List<(Polyline, Extents3d)>();
+
+
+            #region tao bo loc
+            //dinh nghia bo loc
+            TypedValue[] typeValArr = new TypedValue[2];
+            typeValArr.SetValue(new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"), 0);
+            typeValArr.SetValue(new TypedValue((int)DxfCode.LayerName, layName), 1);
+
+            //tao bo loc
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            #region Loc cac polyline
+            //loc doi tuong polyline co layer nhu tren
+            promSeRes = doc.Editor.GetSelection(selectFil);
+            if (promSeRes.Status == PromptStatus.OK)
+            {
+                SelectionSet selectSet = promSeRes.Value;
+                using (Transaction tr1 = doc.TransactionManager.StartTransaction())
+                {
+                    foreach (SelectedObject selObj in selectSet)
+                    {
+                        Entity ent = tr1.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                        if (ent is Polyline pl)
+                        {
+                            plInfos.Add((pl, pl.GeometricExtents));
+                        }
+                    }
+                    tr1.Commit();
+                }
+                //plInfos = plInfos.OrderBy(info => info.ext.MinPoint.X).ToList();
+
+                // Gom nhóm polyline theo Y và sắp theo X trong từng nhóm
+                double yThreshold = 50.0;
+                List<(Polyline pl, Extents3d ext)> sortedPls = new List<(Polyline, Extents3d)>();
+
+                // Sắp theo Y giảm dần, rồi X tăng dần
+                var sortedByY = plInfos
+                    .OrderByDescending(info => info.ext.MinPoint.Y)
+                    .ThenBy(info => info.ext.MinPoint.X)
+                    .ToList();
+
+                // Gom nhóm theo Y threshold
+                List<List<(Polyline pl, Extents3d ext)>> groups = new List<List<(Polyline, Extents3d)>>();
+                List<(Polyline, Extents3d)> currentGroup = new List<(Polyline, Extents3d)>();
+                double? currentY = null;
+
+                foreach (var info in sortedByY)
+                {
+                    double y = info.ext.MinPoint.Y;
+                    if (currentY == null || Math.Abs(y - currentY.Value) <= yThreshold)
+                    {
+                        currentGroup.Add(info);
+                        if (currentY == null)
+                            currentY = y;
+                    }
+                    else
+                    {
+                        groups.Add(currentGroup);
+                        currentGroup = new List<(Polyline, Extents3d)> { info };
+                        currentY = y;
+                    }
+                }
+                if (currentGroup.Any())
+                    groups.Add(currentGroup);
+
+                // Nối lại các nhóm thành danh sách tuần tự đúng: trên xuống, trái sang phải
+                plInfos = groups.SelectMany(g => g.OrderBy(p => p.ext.MinPoint.X)).ToList();
+
+            }
+            #endregion
+
+            #region Yeu cau nguoi dung nhap thong tin hoac chon text
+            // Chọn MText mẫu
+            PromptEntityOptions promptEntOpt = new PromptEntityOptions("\nサンプルの文字を選択してください: ");
+            promptEntOpt.AddAllowedClass(typeof(MText), true);
+            PromptEntityResult promptEntRes = ed.GetEntity(promptEntOpt);
+            if (promptEntRes.Status != PromptStatus.OK) return;
+
+            ObjectId mtextTemplateId = promptEntRes.ObjectId;//lay Id cua Mtext
+
+            // Hoi nguoi dung nhap so bat dau
+            PromptIntegerOptions promptIntOpt = new PromptIntegerOptions("\n何番から始めましょうか??: ");
+            promptIntOpt.AllowNegative = false;
+            PromptIntegerResult promptIntRes = ed.GetInteger(promptIntOpt);
+            if (promptIntRes.Status != PromptStatus.OK) return;
+            int startNumber = promptIntRes.Value;
+            #endregion
+
+            using (Transaction tr2 = doc.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = (BlockTable)tr2.GetObject(dat.BlockTableId, OpenMode.ForRead);
+                BlockTableRecord btr = (BlockTableRecord)tr2.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                MText mtextTemplate = tr2.GetObject(mtextTemplateId, OpenMode.ForRead) as MText;
+                int number = startNumber;//start number
+
+                #region lay ki hieu nhan vien
+                string firstLine = mtextTemplate.Text.ToString().Split('\n')[0];
+                int index = firstLine.IndexOf("number",StringComparison.OrdinalIgnoreCase);
+                string staffCode = "";
+                if (index > 0)
+                {
+                    staffCode = firstLine[index - 1].ToString();
+                }
+                #endregion
+
+                #region viet label cho tung tam vat lieu
+                foreach (var info in plInfos)
+                {
+                    Polyline foundPl = info.pl;
+                    Extents3d ext = info.ext;
+                    double chieucaoPL=info.ext.MaxPoint.Y-info.ext.MinPoint.Y;
+                    double chieurongPL = info.ext.MaxPoint.X - info.ext.MinPoint.X;
+
+                    SetTextsInsidePolylineToLayer(foundPl, "Polyline_Temp", tr2);//doi layer cho text
+                    string abText = FindTextInsidePolyline(foundPl, tr2);//tim ra text ben trong polyline
+                    if (string.IsNullOrEmpty(abText) || !abText.Contains("/")) continue;
+
+                    string pattern = @"^\s*(?<thick>[\d\.]+)\s*/\s*(?<backtxt>.+)\s*$";
+                    Match match = Regex.Match(abText, pattern);
+                    if (!match.Success) continue;
+
+                    string thick = match.Groups["thick"].Value;
+                    string backtxt = match.Groups["backtxt"].Value;
+
+                    // Lấy các ký tự số trong backtxt => count
+                    string count = new string(backtxt.Where(char.IsDigit).ToArray());
+
+                    #region Xet cac ki tu dac biet
+                    // Các flag theo ký tự đặc biệt trong backtxt
+                    string mage = backtxt.Contains("M") ? "曲げ" : "";
+                    string kaisaki = backtxt.Contains("K") ? "開先" : "";
+                    string purena = backtxt.Contains("P") ? "プレーナー" : "";
+                    string senban = backtxt.Contains("S") ? "旋盤" : "";
+                    string machine = backtxt.Contains("G") ? "マシニング" : "";
+                    string zam = backtxt.Contains("Z") ? "＿ZAM" : "";
+                    string sus = backtxt.Contains("U") ? "＿SUS" : "";
+                    string checker = "";
+
+                    if (thick == "2.4" || thick == "3.3"|| thick == "4.6"|| thick == "6.1"|| thick == "9.1")
+                    {
+                        checker= "＿チェッカー";
+                    }
+                    #endregion
+
+                    MText label = mtextTemplate.Clone() as MText;
+                    label.Contents = mtextTemplate.Contents
+                        .Replace("thick", thick)
+                        .Replace("count", count)
+                        .Replace("number", number.ToString()+mage+kaisaki+purena+senban+machine+zam+sus+checker);
+
+                    //xet chieu rong cua text
+                    int index1 = label.Contents.IndexOf("\\");
+                    string firstRowtxt = index1>=0?label.Contents.Substring(0,index1):label.Contents;
+                    double textWidth =firstRowtxt.Length*71/18 ;//hang 1 cua text mau co 18 ki tu, rong 71
+
+                    Point3d basePt=new Point3d();//diem dat Mtext
+                    //mau sac va chieu cao text
+                    if (int.Parse(count) > 8)
+                    {
+                        //tao text moi, ngan gon, chi ghi ten cua mieng thep
+                        Point3d basePt2 = new Point3d(ext.MinPoint.X, ext.MinPoint.Y, 0);//diem dat DBtext
+                        DBText text = new DBText();
+                        text.TextString = staffCode + number.ToString();
+                        text.Layer = "1";
+                        text.ColorIndex =4;//cyan
+                        text.Height = 12;
+                        text.WidthFactor = 0.5;
+                        text.Position = basePt2;
+
+                        label.ColorIndex = 3;//green
+                        label.TextHeight = 4;
+                        label.Width = 0;
+                        basePt = new Point3d(ext.MinPoint.X+text.TextString.Length*text.Height*text.WidthFactor, ext.MinPoint.Y + 14, 0);//dieu chinh 3mm, chieu cao mText gia su 14
+
+                        btr.AppendEntity(text);
+                        tr2.AddNewlyCreatedDBObject(text, true);
+                    }
+                    else
+                    {
+                        if (mtextTemplate.ActualHeight > chieucaoPL-5 || textWidth>chieurongPL-5||chieucaoPL<50||chieurongPL<100)//text bi loi ra mot trong 2 phuong
+                        {
+                            //tao text moi, ngan gon, chi ghi ten cua mieng thep
+                            Point3d basePt2 = new Point3d(ext.MinPoint.X, ext.MinPoint.Y, 0);//diem dat DBtext
+                            DBText text = new DBText();
+                            text.TextString = staffCode + number.ToString();
+                            text.Layer = "1";
+                            text.ColorIndex = 4;//cyan
+                            text.Height = 12;
+                            text.WidthFactor = 0.5;
+                            text.Position = basePt2;
+
+                            label.ColorIndex = 3;//green
+                            label.TextHeight = 4;
+                            label.Width = 0;
+                            basePt = new Point3d(ext.MinPoint.X+ text.TextString.Length * text.Height * text.WidthFactor, ext.MinPoint.Y + 14, 0);//dieu chinh 3mm, chieu cao mText gia su 14
+
+                            btr.AppendEntity(text);
+                            tr2.AddNewlyCreatedDBObject(text, true);
+                        }
+                        else//text khong bi loi ra ca 2 phuong
+                        {
+                            label.ColorIndex = 7;//white
+                            label.TextHeight = 8;
+                            basePt = new Point3d(ext.MinPoint.X, ext.MinPoint.Y + 28, 0);//dieu chinh 3mm, chieu cao mText gia su 28
+                        }
+                    }
+                    
+                    label.Location = basePt;
+                    btr.AppendEntity(label);
+                    tr2.AddNewlyCreatedDBObject(label, true);
+
+                    number++;
+                }
+                #endregion
+
+                tr2.Commit();
+            }
+        }
+
+        #region cac ham phu
+        //tim Mtext ben trong polyline
+        private string FindTextInsidePolyline(Polyline pl, Transaction tr)
+        {
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(pl.BlockId, OpenMode.ForRead);
+            Extents3d bounds = pl.GeometricExtents;
+
+            foreach (ObjectId id in btr)
+            {
+                if (tr.GetObject(id, OpenMode.ForRead) is DBText text)
+                {
+                    Point3d loc = text.Position;
+                    if (loc.X >= bounds.MinPoint.X && loc.X <= bounds.MaxPoint.X &&
+                        loc.Y >= bounds.MinPoint.Y && loc.Y <= bounds.MaxPoint.Y)
+                    {
+                        return text.TextString;
+                    }
+                }
+            }
+            return null;
+        }
+
+        //doi mau text
+        private void SetTextsInsidePolylineToLayer(Polyline pl, string newLayer, Transaction tr)
+        {
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(pl.BlockId, OpenMode.ForRead);
+            Extents3d bounds = pl.GeometricExtents;
+
+            foreach (ObjectId id in btr)
+            {
+                if (tr.GetObject(id, OpenMode.ForRead) is DBText text)
+                {
+                    Point3d pt = text.Position;
+                    if (pt.X >= bounds.MinPoint.X && pt.X <= bounds.MaxPoint.X &&
+                        pt.Y >= bounds.MinPoint.Y && pt.Y <= bounds.MaxPoint.Y)
+                    {
+                        // Mở để ghi và đổi layer
+                        text.UpgradeOpen();
+                        text.Layer = newLayer;
+                        text.ColorIndex = 10;
+                    }
+                }
+            }
+        }
+
+        //ham xoa cac doi tuong polyline va DBtext thuoc layer nhap vao
+        [CommandMethod("LL3")]
+        public void DeletePolylineAndTextByLayer()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                BlockTableRecord ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                foreach (ObjectId id in ms)
+                {
+                    Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    bool isTargetLayer = ent.Layer.Equals(layName, StringComparison.OrdinalIgnoreCase);
+                    bool isPolylineOrText = ent is Polyline || ent is DBText;
+
+                    if (isTargetLayer && isPolylineOrText)
+                    {
+                        ent.UpgradeOpen();
+                        ent.Erase();
+                    }
+                }
+                tr.Commit();
+            }
+        }
+        #endregion
+    }
+}
