@@ -1,0 +1,304 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.ConstrainedExecution;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LazerLabel.Numbering
+{
+    public class TextForPDF
+    {
+        [CommandMethod("LL4")]
+        public void GetTextForPDF()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<(Polyline pl, Extents3d ext)> plInfos = new List<(Polyline, Extents3d)>();
+
+            #region tao bo loc
+            //dinh nghia bo loc
+            TypedValue[] typeValArr = new TypedValue[2];
+            typeValArr.SetValue(new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"), 0);
+            typeValArr.SetValue(new TypedValue((int)DxfCode.LayerName, layName), 1);
+
+            //tao bo loc
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            #region Loc cac polyline
+            //loc doi tuong polyline co layer nhu tren
+            promSeRes = doc.Editor.GetSelection(selectFil);
+            if (promSeRes.Status == PromptStatus.OK)
+            {
+                SelectionSet selectSet = promSeRes.Value;
+                using (Transaction tr1 = doc.TransactionManager.StartTransaction())
+                {
+                    foreach (SelectedObject selObj in selectSet)
+                    {
+                        Entity ent = tr1.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                        if (ent is Polyline pl)
+                        {
+                            plInfos.Add((pl, pl.GeometricExtents));
+                        }
+                    }
+                    tr1.Commit();
+                }
+                // Gom nhóm polyline theo Y và sắp theo X trong từng nhóm
+                double yThreshold = 50.0;
+                List<(Polyline pl, Extents3d ext)> sortedPls = new List<(Polyline, Extents3d)>();
+
+                // Sắp theo Y giảm dần, rồi X tăng dần
+                var sortedByY = plInfos
+                    .OrderByDescending(info => info.ext.MinPoint.Y)
+                    .ThenBy(info => info.ext.MinPoint.X)
+                    .ToList();
+
+                // Gom nhóm theo Y threshold
+                List<List<(Polyline pl, Extents3d ext)>> groups = new List<List<(Polyline, Extents3d)>>();
+                List<(Polyline, Extents3d)> currentGroup = new List<(Polyline, Extents3d)>();
+                double? currentY = null;
+
+                foreach (var info in sortedByY)
+                {
+                    double y = info.ext.MinPoint.Y;
+                    if (currentY == null || Math.Abs(y - currentY.Value) <= yThreshold)
+                    {
+                        currentGroup.Add(info);
+                        if (currentY == null)
+                            currentY = y;
+                    }
+                    else
+                    {
+                        groups.Add(currentGroup);
+                        currentGroup = new List<(Polyline, Extents3d)> { info };
+                        currentY = y;
+                    }
+                }
+                if (currentGroup.Any())
+                    groups.Add(currentGroup);
+
+                // Nối lại các nhóm thành danh sách tuần tự đúng: trên xuống, trái sang phải
+                plInfos = groups.SelectMany(g => g.OrderBy(p => p.ext.MinPoint.X)).ToList();
+            }
+            #endregion
+
+            // Khởi tạo list chứa kết quả cuối cùng
+            List<string> extractedStrings = new List<string>();
+
+            using (Transaction tr2 = doc.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = (BlockTable)tr2.GetObject(dat.BlockTableId, OpenMode.ForRead);
+                BlockTableRecord btr = (BlockTableRecord)tr2.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (var (pl, ext) in plInfos)
+                {
+                    // 1. Mở rộng extents 20mm mỗi phía (chuyển về đơn vị bản vẽ nếu cần)
+                    double offset = 20.0;
+                    Extents3d extendedExt = new Extents3d(
+                        new Point3d(ext.MinPoint.X - offset, ext.MinPoint.Y - offset, ext.MinPoint.Z),
+                        new Point3d(ext.MaxPoint.X + offset, ext.MaxPoint.Y + offset, ext.MaxPoint.Z)
+                    );
+
+                    // 2. Tìm MText nằm trong vùng ext
+                    MText foundMText = null;
+                    foreach (ObjectId objId in btr)
+                    {
+                        Entity ent = tr2.GetObject(objId, OpenMode.ForRead) as Entity;
+                        if (ent is MText mtext)
+                        {
+                            Point3d pos = mtext.Location;
+                            if (pos.X >= extendedExt.MinPoint.X && pos.X <= extendedExt.MaxPoint.X &&
+                                pos.Y >= extendedExt.MinPoint.Y && pos.Y <= extendedExt.MaxPoint.Y)
+                            {
+                                if (mtext.Contents.Contains("/"))
+                                {
+                                    foundMText = mtext;
+                                    break; // Chỉ lấy 1 MText đầu tiên thỏa
+                                }
+                            }
+                        }
+                    }
+
+                    if (foundMText != null)
+                    {
+                        extractedStrings.Add(foundMText.Contents);
+                    }
+                }
+
+                tr2.Commit();
+            }
+
+            // Phân tích chuỗi
+            List<string> line1txtList = new List<string>();
+            List<string> nameList = new List<string>();
+            List<string> kakoList = new List<string>();
+            List<string> thickList = new List<string>();
+            List<string> countList = new List<string>();
+
+            foreach (string content in extractedStrings)
+            {
+                // 3. line1txt = chuỗi bên trái dấu "\" đầu tiên
+                string line1txt = content.Split('\\').FirstOrDefault() ?? "";//text dong dau tien
+                string strName1 = "";
+                string strName2 = "";
+                string strKako = "";
+
+                #region lay Name va kakotxt
+                // Các ký tự bạn muốn giữ lại trong strkako
+                char[] allowedChars = { '曲', '開', 'プ', 'レ'};
+
+                bool foundLetter=false;
+                for (int i = 4; i < line1txt.Length; i++)
+                {
+                    char c = line1txt[i];
+
+                    if (!foundLetter && char.IsLetter(c))
+                    {
+                        strName1 = c.ToString();
+                        foundLetter = true;
+                        continue;
+                    }
+                    if (foundLetter)
+                    {
+                        if (char.IsDigit(c))
+                        {
+                            strName2 += c;
+                        }
+                        else if (allowedChars.Contains(c))
+                        {
+                            strKako += c;
+                        }
+                    }
+                }
+                string strName = strName1+strName2;
+
+                // Nếu có "プレ" thì thay bằng "プレー"
+                if (strKako.Contains("プレ"))
+                {
+                    strKako = strKako.Replace("プレ", "プレー");
+                }
+                #endregion
+
+                #region lay thick
+                // 4. thick = chuỗi giữa "T/" và "\"
+                string thick = "";
+                int idxT = content.IndexOf("T/");
+                int idxBackslash = content.IndexOf('\\', idxT);
+                if (idxT >= 0 && idxBackslash > idxT)
+                {
+                    thick = content.Substring(idxT + 2, idxBackslash - (idxT + 2));
+                }
+                #endregion
+
+                #region lay count
+                // 5. count = chuỗi sau dấu "/" cuối cùng
+                string count = "";
+                int idxLastSlash = content.LastIndexOf('/');
+                if (idxLastSlash >= 0 && idxLastSlash < content.Length - 1)
+                {
+                    count = content.Substring(idxLastSlash + 1);
+                }
+                #endregion
+
+                nameList.Add(strName.Trim());
+                kakoList.Add(strKako.Trim());
+                thickList.Add(thick.Trim());
+                countList.Add(count.Trim());
+            }
+
+            // Yêu cầu người dùng chọn block mẫu
+            PromptEntityOptions prompEntOpt = new PromptEntityOptions("\nサンプルのブロックを選択してください: ");
+            prompEntOpt.AddAllowedClass(typeof(BlockReference), true);
+            PromptEntityResult prompEntRes = ed.GetEntity(prompEntOpt);
+            if (prompEntRes.Status != PromptStatus.OK) return;
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                BlockReference baseBlock = tr.GetObject(prompEntRes.ObjectId, OpenMode.ForRead) as BlockReference;
+                if (baseBlock == null)
+                {
+                    ed.WriteMessage("\n選択したオブジェクトはブロックではありません!!!");
+                    return;
+                }
+
+                Point3d basePoint = baseBlock.Position;
+
+                // Tên của block mẫu
+                string blockName = (tr.GetObject(baseBlock.BlockTableRecord, OpenMode.ForRead) as BlockTableRecord).Name;
+
+                BlockTable blTb = tr.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                for (int i = 0; i < nameList.Count; i++)
+                {
+                    #region tao block moi va dat vao dung vi tri
+                    // Tính vị trí mới
+                    int col = i / 18;
+                    int row = i % 18;
+                    double offsetX = col * 240.0;
+                    double offsetY = -row * 150.0;
+                    Point3d newPos = new Point3d(basePoint.X + offsetX, basePoint.Y + offsetY, basePoint.Z);
+
+                    // Tạo block mới
+                    BlockReference newBlock = new BlockReference(newPos, baseBlock.BlockTableRecord);
+                    blTbRec.AppendEntity(newBlock);
+                    tr.AddNewlyCreatedDBObject(newBlock, true);
+                    #endregion
+
+                    #region Copy thuộc tính từ định nghĩa gốc
+                    if (baseBlock.AttributeCollection.Count > 0)
+                    {
+                        BlockTableRecord btr =tr.GetObject(baseBlock.BlockTableRecord, OpenMode.ForRead) as BlockTableRecord;
+                        foreach (ObjectId id in btr)
+                        {
+                            if (tr.GetObject(id, OpenMode.ForRead) is AttributeDefinition attDef && !attDef.Constant)
+                            {
+                                AttributeReference attRef = new AttributeReference();
+                                attRef.SetAttributeFromBlock(attDef, newBlock.BlockTransform);
+                                attRef.Position = attDef.Position.TransformBy(newBlock.BlockTransform);//buoc quan trong, neu khong co transform=> thuoc tinh cap nhat khong day du
+
+                                switch (attDef.Tag.ToUpper())
+                                {
+                                    case "BUZAINAME":
+                                        attRef.TextString = nameList[i];
+                                        break;
+                                    case "KAKO":
+                                        attRef.TextString = kakoList[i];
+                                        //attRef.TextString = "aaaa";
+                                        break;
+                                    case "THICK":
+                                        attRef.TextString = thickList[i];
+                                        break;
+                                    case "COUNT":
+                                        attRef.TextString = countList[i];
+                                        break;
+                                    default:
+                                        attRef.TextString = "";
+                                        break;
+                                }
+
+                                newBlock.AttributeCollection.AppendAttribute(attRef);
+                                tr.AddNewlyCreatedDBObject(attRef, true);
+                            }
+                        }
+                    }
+                    #endregion
+                }
+                baseBlock.UpgradeOpen();
+                baseBlock.Erase();//xoa block mau
+
+                tr.Commit();
+            }
+        }
+    }
+}
