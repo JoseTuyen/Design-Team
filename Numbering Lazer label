@@ -186,19 +186,21 @@ namespace LazerLabel.Numbering
                     if (int.Parse(count) > 8)
                     {
                         //tao text moi, ngan gon, chi ghi ten cua mieng thep
-                        Point3d basePt2 = new Point3d(ext.MinPoint.X, ext.MinPoint.Y, 0);//diem dat DBtext
+                        Point3d basePt2 = new Point3d(ext.MinPoint.X+2.5, ext.MinPoint.Y+2.5, 0);//diem dat DBtext
                         DBText text = new DBText();
                         text.TextString = staffCode + number.ToString();
+                        text.TextStyleId=label.TextStyleId;
                         text.Layer = "1";
                         text.ColorIndex =4;//cyan
                         text.Height = 12;
                         text.WidthFactor = 0.5;
                         text.Position = basePt2;
+                        
 
                         label.ColorIndex = 3;//green
                         label.TextHeight = 4;
                         label.Width = 0;
-                        basePt = new Point3d(ext.MinPoint.X+text.TextString.Length*text.Height*text.WidthFactor, ext.MinPoint.Y + 14, 0);//dieu chinh 3mm, chieu cao mText gia su 14
+                        basePt = new Point3d(ext.MinPoint.X+2.5+text.TextString.Length*text.Height*text.WidthFactor, ext.MinPoint.Y + 14-2.5, 0);//dieu chinh 2.5mm, chieu cao mText gia su 14
 
                         btr.AppendEntity(text);
                         tr2.AddNewlyCreatedDBObject(text, true);
@@ -208,9 +210,10 @@ namespace LazerLabel.Numbering
                         if (mtextTemplate.ActualHeight > chieucaoPL-5 || textWidth>chieurongPL-5||chieucaoPL<50||chieurongPL<100)//text bi loi ra mot trong 2 phuong
                         {
                             //tao text moi, ngan gon, chi ghi ten cua mieng thep
-                            Point3d basePt2 = new Point3d(ext.MinPoint.X, ext.MinPoint.Y, 0);//diem dat DBtext
+                            Point3d basePt2 = new Point3d(ext.MinPoint.X+2.5, ext.MinPoint.Y+2.5, 0);//diem dat DBtext
                             DBText text = new DBText();
                             text.TextString = staffCode + number.ToString();
+                            text.TextStyleId = label.TextStyleId;
                             text.Layer = "1";
                             text.ColorIndex = 4;//cyan
                             text.Height = 12;
@@ -220,7 +223,7 @@ namespace LazerLabel.Numbering
                             label.ColorIndex = 3;//green
                             label.TextHeight = 4;
                             label.Width = 0;
-                            basePt = new Point3d(ext.MinPoint.X+ text.TextString.Length * text.Height * text.WidthFactor, ext.MinPoint.Y + 14, 0);//dieu chinh 3mm, chieu cao mText gia su 14
+                            basePt = new Point3d(ext.MinPoint.X+2.5+ text.TextString.Length * text.Height * text.WidthFactor, ext.MinPoint.Y + 14-2.5, 0);//dieu chinh 2.5mm, chieu cao mText gia su 14
 
                             btr.AppendEntity(text);
                             tr2.AddNewlyCreatedDBObject(text, true);
@@ -229,7 +232,7 @@ namespace LazerLabel.Numbering
                         {
                             label.ColorIndex = 7;//white
                             label.TextHeight = 8;
-                            basePt = new Point3d(ext.MinPoint.X, ext.MinPoint.Y + 28, 0);//dieu chinh 3mm, chieu cao mText gia su 28
+                            basePt = new Point3d(ext.MinPoint.X+2.5, ext.MinPoint.Y + 28-2.5, 0);//dieu chinh 2.5mm, chieu cao mText gia su 28
                         }
                     }
                     
