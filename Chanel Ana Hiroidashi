@@ -60,7 +60,7 @@ namespace GetAnguruAna.ChaneruAna
                 }
                 #endregion
 
-                List<string> elementCodeArr = new List<string>();
+                List<string> elementCodeArr = new List<string>();//list ten goi cau kien
 
                 #region xet cac polyline da duoc sap xep, bat cap cac polyline
                 int iChay = 0;
@@ -115,14 +115,14 @@ namespace GetAnguruAna.ChaneruAna
                                     }
                                 }
                             }
-                            if (circleList1.Count > 0)
+                            if (circleList1.Count > 0)//them cac duong tron co san vao list circle cua hinh 1
                             {
                                 for (int kChay = 0; kChay < circleList1.Count; kChay++)
                                 {
                                     allCircleList1.Add(circleList1[kChay]);
                                 }
                             }
-                            if (convertCircleList1.Count > 0)
+                            if (convertCircleList1.Count > 0)//them cac duong tron da chuyen doi vao list circle cua hinh 1
                             {
                                 for (int kChay = 0; kChay < convertCircleList1.Count; kChay++)
                                 {
@@ -591,8 +591,14 @@ namespace GetAnguruAna.ChaneruAna
                 {
                     double radius = circle.Radius; // dùng radius để khởi tạo
                     Point3d center1 = new Point3d();
-                    center1 = new Point3d(blockRef.Position.X, blockRef.Position.Y + 100, 0);
-
+                    if (radius == 5.5 || radius == 6.7)
+                    {
+                        center1 = new Point3d(blockRef.Position.X, blockRef.Position.Y + 100, 0);//truong hop nockpin
+                    }
+                    else
+                    {
+                        center1 = new Point3d(blockRef.Position.X, blockRef.Position.Y, 0);
+                    }
                     // Tạo đường tròn mới với tâm là điểm đặt block
                     Circle newCircle = new Circle
                     {
@@ -611,7 +617,7 @@ namespace GetAnguruAna.ChaneruAna
         //tao ra ham nhan dien doc lo tu trai sang phai hay nguoc lai
         public string GetAnaMuki(Point3d minPt, Point3d maxPt)
         {
-            string direcTion = "LeftToRight1";//mac dinh la trai sang phai,canh quay ra
+            string direcTion = "LeftToRight";//mac dinh la trai sang phai,canh quay ra
             Document doc = Application.DocumentManager.MdiActiveDocument;
             Database dat = doc.Database;
             Editor ed = doc.Editor;
@@ -647,7 +653,7 @@ namespace GetAnguruAna.ChaneruAna
                         double length = line.Length;
 
                         // 3. Kiểm tra chiều dài trong ngưỡng
-                        if (length >= windowLength - 10 && length <= windowLength + 1 && line.StartPoint.Y != minPt.Y && line.StartPoint.Y != maxPt.Y)//sai so la 1mm
+                        if (length >= windowLength - 60 && length <= windowLength + 41 && Math.Abs(line.StartPoint.Y -minPt.Y)>1 && Math.Abs(line.StartPoint.Y - maxPt.Y)>1)//sai so la 1mm
                         {
                             validLines.Add(line);
                         }
