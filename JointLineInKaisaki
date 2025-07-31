@@ -1,0 +1,228 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LazerLabel.Kaisaki
+{
+    public class JointLine
+    {
+        [CommandMethod("K2_JointLines")]
+        public void JointClosedLine()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<Polyline> polyList = new List<Polyline>();
+
+            #region tao bo loc
+            //dinh nghia bo loc
+            TypedValue[] typeValArr = new TypedValue[2];
+            typeValArr.SetValue(new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"), 0);
+            typeValArr.SetValue(new TypedValue((int)DxfCode.LayerName, layName), 1);
+
+            //tao bo loc
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable blTb = tr.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                #region lay cac polyline
+                promSeRes = doc.Editor.GetSelection(selectFil);
+                if (promSeRes.Status == PromptStatus.OK)
+                {
+                    SelectionSet selSet = promSeRes.Value;
+                    foreach (SelectedObject selObj in selSet)
+                    {
+                        Polyline pl = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Polyline;
+                        if (pl != null)
+                        {
+                            polyList.Add(pl);
+                        }
+                    }
+                }
+                #endregion
+
+                #region duyet qua tung polyline va lay list cac net green-continous
+                foreach (Polyline pl in polyList)
+                {
+                    List<Line> kaisakiLines = new List<Line>();
+                    Extents3d plExt = pl.GeometricExtents;
+
+                    // Mở rộng mỗi chiều 20mm
+                    double offset = 20.0;
+                    Point3d winMin = new Point3d(plExt.MinPoint.X - offset, plExt.MinPoint.Y - offset, 0);
+                    Point3d winMax = new Point3d(plExt.MaxPoint.X + offset, plExt.MaxPoint.Y + offset, 0);
+
+                    #region Tạo filter để chọn LINE
+                    TypedValue[] filterList = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "LINE")
+                    };
+                    SelectionFilter lineFilter = new SelectionFilter(filterList);
+                    #endregion
+
+                    PromptSelectionResult lineSelRes = ed.SelectWindow(winMin, winMax, lineFilter);
+                    if (lineSelRes.Status != PromptStatus.OK) continue;
+                    LayerTable layerTable = tr.GetObject(dat.LayerTableId, OpenMode.ForRead) as LayerTable;
+
+                    foreach (SelectedObject selObj in lineSelRes.Value)
+                    {
+                        Line line = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Line;
+                        if (line != null && line.ColorIndex == 3)
+                        {
+                            // Kiểm tra kiểu nét (linetype)
+                            string linetypeName = line.Linetype;
+                            if (linetypeName == "ByLayer" && layerTable.Has(line.Layer))
+                            {
+                                LayerTableRecord layer = tr.GetObject(layerTable[line.Layer], OpenMode.ForRead) as LayerTableRecord;
+                                ObjectId linetypeId = layer.LinetypeObjectId;
+
+                                if (!linetypeId.IsNull)
+                                {
+                                    LinetypeTableRecord ltr = tr.GetObject(linetypeId, OpenMode.ForRead) as LinetypeTableRecord;
+                                    if (ltr != null)
+                                    {
+                                        linetypeName = ltr.Name;
+                                    }
+                                }
+                            }
+                            if (linetypeName.Equals("Continuous", StringComparison.OrdinalIgnoreCase))
+                            {
+                                kaisakiLines.Add(line);
+                            }    
+                        }
+                    }
+
+                    if (kaisakiLines.Count < 2) return;
+
+                    double tolerance = 0.5;
+                    List<Line> remaining = new List<Line>(kaisakiLines);
+                    HashSet<ObjectId> processed = new HashSet<ObjectId>();
+
+                    while (remaining.Count > 0)
+                    {
+                        Line current = remaining[0];
+                        remaining.RemoveAt(0);
+                        if (processed.Contains(current.ObjectId)) continue;
+
+                        List<Line> group = new List<Line> { current };
+                        processed.Add(current.ObjectId);
+
+                        Point3d head = current.StartPoint;
+                        Point3d tail = current.EndPoint;
+                        Vector3d baseDir = (tail - head).GetNormal();
+
+                        bool found;
+                        do
+                        {
+                            found = false;
+
+                            for (int i = 0; i < remaining.Count; i++)
+                            {
+                                Line candidate = remaining[i];
+                                Vector3d candDir = (candidate.EndPoint - candidate.StartPoint).GetNormal();
+
+                                if (!baseDir.IsParallelTo(candDir, new Tolerance(1e-6, 1e-6))) continue;
+
+                                if (tail.DistanceTo(candidate.StartPoint) <= tolerance)
+                                {
+                                    tail = candidate.EndPoint;
+                                    group.Add(candidate);
+                                    processed.Add(candidate.ObjectId);
+                                    remaining.RemoveAt(i);
+                                    found = true;
+                                    break;
+                                }
+                                else if (tail.DistanceTo(candidate.EndPoint) <= tolerance)
+                                {
+                                    tail = candidate.StartPoint;
+                                    group.Add(candidate);
+                                    processed.Add(candidate.ObjectId);
+                                    remaining.RemoveAt(i);
+                                    found = true;
+                                    break;
+                                }
+                                else if (head.DistanceTo(candidate.EndPoint) <= tolerance)
+                                {
+                                    head = candidate.StartPoint;
+                                    group.Insert(0, candidate);
+                                    processed.Add(candidate.ObjectId);
+                                    remaining.RemoveAt(i);
+                                    found = true;
+                                    break;
+                                }
+                                else if (head.DistanceTo(candidate.StartPoint) <= tolerance)
+                                {
+                                    head = candidate.EndPoint;
+                                    group.Insert(0, candidate);
+                                    processed.Add(candidate.ObjectId);
+                                    remaining.RemoveAt(i);
+                                    found = true;
+                                    break;
+                                }
+                            }
+
+                        } while (found);
+
+                        // Nếu nhóm đủ lớn (≥2 đoạn) → tạo 1 LINE mới
+                        if (group.Count >= 2)
+                        {
+                            // Tìm 2 điểm xa nhất trong nhóm
+                            List<Point3d> allPts = new List<Point3d>();
+                            foreach (Line l in group)
+                            {
+                                allPts.Add(l.StartPoint);
+                                allPts.Add(l.EndPoint);
+                            }
+
+                            double maxDist = 0;
+                            Point3d pt1 = Point3d.Origin, pt2 = Point3d.Origin;
+
+                            for (int i = 0; i < allPts.Count; i++)
+                            {
+                                for (int j = i + 1; j < allPts.Count; j++)
+                                {
+                                    double dist = allPts[i].DistanceTo(allPts[j]);
+                                    if (dist > maxDist)
+                                    {
+                                        maxDist = dist;
+                                        pt1 = allPts[i];
+                                        pt2 = allPts[j];
+                                    }
+                                }
+                            }
+
+                            Line joined = new Line(pt1, pt2)
+                            {
+                                ColorIndex = 3
+                            };
+                            blTbRec.AppendEntity(joined);
+                            tr.AddNewlyCreatedDBObject(joined, true);
+
+                            //XÓA các LINE gốc đã dùng để joint:
+                            foreach (var l in group)
+                            {
+                                if (!l.IsErased) l.UpgradeOpen(); // Phải mở để ghi
+                                l.Erase();
+                            }
+                        }
+                    }
+                }
+                #endregion
+
+                tr.Commit();
+            }
+        }
+    }
+}
