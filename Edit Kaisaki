@@ -1,0 +1,599 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.Colors;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+using static LazerLabel.Numbering.LazerNumbering;
+
+namespace LazerLabel.Kaisaki
+{
+    public class EditKaisaki
+    {
+        [CommandMethod("K1_EditKaisaki")]
+        public void KaisakiEdit()
+        { 
+            Document doc=Application.DocumentManager.MdiActiveDocument;
+            Database dat=doc.Database;
+            Editor ed=doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<Polyline> polyList = new List<Polyline>();
+
+            #region tao bo loc
+            //dinh nghia bo loc
+            TypedValue[] typeValArr = new TypedValue[2];
+            typeValArr.SetValue(new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"), 0);
+            typeValArr.SetValue(new TypedValue((int)DxfCode.LayerName, layName), 1);
+
+            //tao bo loc
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable blTb = tr.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                #region lay cac polyline
+                promSeRes = doc.Editor.GetSelection(selectFil);
+                if (promSeRes.Status == PromptStatus.OK)
+                {
+                    SelectionSet selSet = promSeRes.Value;
+                    foreach (SelectedObject selObj in selSet)
+                    {
+                        Polyline pl = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Polyline;
+                        if (pl != null)
+                        {
+                            polyList.Add(pl);
+                        }
+                    }
+                }
+                #endregion
+
+                #region duyet qua tung polyline va lay list cac net dut
+                foreach (Polyline pl in polyList)
+                {
+                    List<Line> kaisakiLines = new List<Line>();
+                    Extents3d plExt = pl.GeometricExtents;
+
+                    // Mở rộng mỗi chiều 20mm
+                    double offset = 20.0;
+                    Point3d winMin = new Point3d(plExt.MinPoint.X - offset, plExt.MinPoint.Y - offset, 0);
+                    Point3d winMax = new Point3d(plExt.MaxPoint.X + offset, plExt.MaxPoint.Y + offset, 0);
+
+                    #region Tạo filter để chọn LINE
+                    TypedValue[] filterList = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "LINE")
+                    };
+                    SelectionFilter lineFilter = new SelectionFilter(filterList);
+
+                    // Chọn các line trong vùng mở rộng
+                    PromptSelectionResult selRes = ed.SelectWindow(winMin, winMax, lineFilter);
+
+                    if (selRes.Status != PromptStatus.OK) continue;
+
+                    SelectionSet lineSet = selRes.Value;
+
+                    foreach (SelectedObject selObj in lineSet)
+                    {
+                        Line line = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Line;
+                        if (line != null)
+                        {
+                            string linetype = line.Linetype;
+                            if (!linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase) && line.Length>20)
+                            {
+                                kaisakiLines.Add(line);
+                            }
+                        }
+                    }
+                    #endregion
+
+                    if (kaisakiLines.Count > 0)
+                    {
+                        for (int i = 0; i < kaisakiLines.Count; i++)
+                        {
+                            Line line1 = kaisakiLines[i];//line kaisaki (net dut)
+                            Line line2 = FindParallelNearbyLine(dat, line1, winMin, winMax);//net lien ben canh kaisaki
+
+                            if (line2 == null)
+                            {
+                                continue;
+                            }
+                            Line line3 = CreateOffsetLineOpposite(dat, line1, line2);//day la line offset 0.5mm
+                            List<ObjectId> connectedLineIds = FindConnectedLineIdsInWindow(dat, line2, winMin, winMax, 0.1);//cac net noi lien voi line2
+
+                            if (connectedLineIds.Count == 0)
+                            {
+                                continue;
+                            }
+                            foreach (ObjectId id in connectedLineIds)
+                            {
+                                FilletTwoLines(doc, line3.ObjectId, id);
+                            }
+
+                            #region tao dim
+                            Point3d PtMin = plExt.MinPoint;
+                            Point3d PtMax = plExt.MaxPoint;
+                            Point3d p2 = new Point3d(PtMax.X, PtMin.Y, 0);
+                            Point3d p3 = new Point3d(PtMin.X, PtMax.Y, 0);
+
+                            //dim X
+                            CreateDimensionX(PtMin, p2, -80, tr, dat);
+
+                            //dim Y
+                            CreateDimensionY(PtMin, p3, -80, tr, dat);
+                            #endregion
+                        }
+                    }
+                }
+                #endregion
+
+                tr.Commit();
+            }
+
+            //noi cac polyline duong bao bi ho
+            using (Transaction tr1 = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable blTb = tr1.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr1.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                #region duyet qua tung polyline va lay list cac net continous mau xanh
+                foreach (Polyline pl in polyList)
+                {
+                    List<Line> kaisakiLines = new List<Line>();
+                    Extents3d plExt = pl.GeometricExtents;
+
+                    // Mở rộng mỗi chiều 20mm
+                    double offset = 20.0;
+                    Point3d winMin = new Point3d(plExt.MinPoint.X - offset, plExt.MinPoint.Y - offset, 0);
+                    Point3d winMax = new Point3d(plExt.MaxPoint.X + offset, plExt.MaxPoint.Y + offset, 0);
+
+                    CloseGapLinesInWindow(dat, winMin, winMax, 1);
+                }
+                #endregion
+                tr1.Commit();
+            }
+
+        }
+
+        #region ham dung chung
+        //tim line song song voi line dua vao
+        public static Line FindParallelNearbyLine(Database db, Line refLine, Point3d winMin, Point3d winMax)
+        {
+            Editor ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            // Tạo filter chọn LINE
+            TypedValue[] filterVals = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LINE")
+            };
+            SelectionFilter filter = new SelectionFilter(filterVals);
+
+            // Chọn các line trong phạm vi cửa sổ
+            PromptSelectionResult selRes = ed.SelectWindow(winMin, winMax, filter);
+            if (selRes.Status != PromptStatus.OK) return null;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                SelectionSet selSet = selRes.Value;
+                Vector3d refDir = (refLine.EndPoint - refLine.StartPoint).GetNormal();
+
+                foreach (SelectedObject selObj in selSet)
+                {
+                    if (selObj.ObjectId == refLine.ObjectId) continue;
+
+                    Line otherLine = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Line;
+                    if (otherLine == null) continue;
+
+                    Vector3d otherDir = (otherLine.EndPoint - otherLine.StartPoint).GetNormal();
+
+                    // Kiểm tra song song (hoặc ngược hướng)
+                    double dot = Math.Abs(refDir.DotProduct(otherDir));
+                    if (dot < 0.999) continue;
+
+                    // Tính khoảng cách vuông góc từ midpoint refLine đến otherLine
+                    Point3d midRef = refLine.StartPoint + 0.5 * (refLine.EndPoint - refLine.StartPoint);
+                    Point3d proj = otherLine.GetClosestPointTo(midRef, false);
+                    double dist = midRef.DistanceTo(proj);
+
+                    if (dist < 20.0)
+                    {
+                        Line writableOtherLine = tr.GetObject(otherLine.ObjectId, OpenMode.ForWrite) as Line;
+                        if (writableOtherLine != null)
+                        {
+                            writableOtherLine.Layer = refLine.Layer;
+                            writableOtherLine.Color = refLine.Color;
+                            writableOtherLine.Linetype = refLine.Linetype;
+                        }
+
+                        tr.Commit();
+                        return writableOtherLine; // hoặc otherLine cũng được vì cùng ID
+                    }
+                }
+
+                tr.Commit();
+            }
+            return null;
+        }
+
+        //tao line offset cua canh kaisaki
+        public static Line CreateOffsetLineOpposite(Database db, Line line1, Line line2)
+        {
+            Line resultLine = null;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                // Lấy bảng block hiện tại (ModelSpace)
+                BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                #region set lai diem start/end cua line2
+                Point3d l2_endPt = new Point3d();
+                Point3d l2_startPt=new Point3d();
+                if (line2.EndPoint.X > line2.StartPoint.X)
+                {
+                    l2_endPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+                    l2_startPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+                }
+                else if (line2.EndPoint.X < line2.StartPoint.X)
+                {
+                    l2_startPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+                    l2_endPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+                }
+                else//line2.EndPoint.X = line2.StartPoint.X
+                {
+                    if (line2.EndPoint.Y < line2.StartPoint.Y)
+                    {
+                        l2_startPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+                        l2_endPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+                    }
+                    else
+                    {
+                        l2_endPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+                        l2_startPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+                    }
+                }
+                #endregion
+
+                // Tính vector pháp tuyến của line2
+                Vector3d dir = (l2_endPt - l2_startPt).GetNormal();
+                Vector3d normal = dir.RotateBy(Math.PI / 2, Vector3d.ZAxis); // pháp tuyến trái
+
+                // Dùng midpoint của line2 để kiểm tra vị trí line1
+                Point3d midLine2 = l2_startPt + 0.5 * (l2_endPt - l2_startPt);
+                Point3d testPt = midLine2 + normal;
+
+                // Đo khoảng cách từ testPt đến line1
+                Point3d closest = line1.GetClosestPointTo(testPt, false);
+                double distPositive = testPt.DistanceTo(closest);
+
+                // Nếu pháp tuyến đang hướng về phía line1 thì đảo ngược
+                if (distPositive < GetParallelLineDistance(line1,line2)) // Ngưỡng gần để xác định hướng
+                {
+                    normal = -normal;
+                }
+
+                // Offset 0.5mm theo hướng đúng
+                double offsetDist = 0.5;
+                Vector3d offsetVec = normal.MultiplyBy(offsetDist);
+                Point3d newStart = line2.StartPoint + offsetVec;
+                Point3d newEnd = line2.EndPoint + offsetVec;
+
+                resultLine = new Line(newStart, newEnd);
+                resultLine.Layer = "1";
+                resultLine.ColorIndex = 3;
+                btr.AppendEntity(resultLine);
+                tr.AddNewlyCreatedDBObject(resultLine, true);
+
+                tr.Commit();
+            }
+            return resultLine;
+        }
+
+        //tinh khoang cach 2 duong thang song song
+        public static double GetParallelLineDistance(Line line1, Line line2)
+        {
+            // Lấy midpoint của line1
+            Point3d mid1 = line1.StartPoint + 0.5 * (line1.EndPoint - line1.StartPoint);
+
+            // Tìm điểm gần nhất trên line2 đến midpoint đó
+            Point3d closest = line2.GetClosestPointTo(mid1, false);
+
+            // Trả về khoảng cách giữa 2 điểm
+            return mid1.DistanceTo(closest);
+        }
+
+        //tim line noi tiep hai dau cua line cung cap
+        public static List<ObjectId> FindConnectedLineIdsInWindow(Database db,Line refLine,Point3d minPoint,Point3d maxPoint,double tolerance = 0.001)
+        {
+            List<ObjectId> connectedIds = new List<ObjectId>();
+            Editor ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            // Filter chỉ chọn LINE
+            TypedValue[] filterVals = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LINE")
+            };
+            SelectionFilter filter = new SelectionFilter(filterVals);
+
+            // Chọn line trong cửa sổ
+            PromptSelectionResult selRes = ed.SelectWindow(minPoint, maxPoint, filter);
+            if (selRes.Status != PromptStatus.OK) return connectedIds;
+
+            SelectionSet selSet = selRes.Value;
+            Point3d refStart = refLine.StartPoint;
+            Point3d refEnd = refLine.EndPoint;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (SelectedObject selObj in selSet)
+                {
+                    if (selObj.ObjectId == refLine.ObjectId) continue;
+
+                    Line line = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Line;
+                    if (line == null) continue;
+
+                    Point3d s = line.StartPoint;
+                    Point3d e = line.EndPoint;
+
+                    bool isConnected =
+                        s.IsEqualTo(refStart, new Tolerance(tolerance, tolerance)) ||
+                        s.IsEqualTo(refEnd, new Tolerance(tolerance, tolerance)) ||
+                        e.IsEqualTo(refStart, new Tolerance(tolerance, tolerance)) ||
+                        e.IsEqualTo(refEnd, new Tolerance(tolerance, tolerance));
+
+                    if (isConnected)
+                    {
+                        connectedIds.Add(selObj.ObjectId);
+                    }
+                }
+
+                tr.Commit();
+            }
+
+            return connectedIds;
+        }
+
+        //thay the line cu bang line moi da extend=>bo tron ban kinh bang 0
+        public static void FilletTwoLines(Document doc, ObjectId id1, ObjectId id2)
+        {
+            // Chuyển sang lệnh FILLET với radius 0
+            string cmd = $"_.FILLET _R 0 ";
+            cmd += $"(handent \"{id1.Handle}\") (handent \"{id2.Handle}\") ";
+
+            doc.SendStringToExecute(cmd, true, false, false);
+        }
+
+        //Noi cac line gan nhau con dang ho
+        public static void CloseGapLinesInWindow(Database db, Point3d winMin, Point3d winMax, double gapTolerance = 2.0)
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+
+            // Filter chọn các LINE trong vùng window
+            TypedValue[] filterVals = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LINE")
+            };
+            SelectionFilter filter = new SelectionFilter(filterVals);
+
+            PromptSelectionResult selRes = ed.SelectWindow(winMin, winMax, filter);
+            if (selRes.Status != PromptStatus.OK) return;
+
+            SelectionSet selSet = selRes.Value;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                // Thu thập các line hợp lệ
+                List<Line> lineList = new List<Line>();
+                foreach (SelectedObject selObj in selSet)
+                {
+                    Line ln = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Line;
+                    if (ln == null) continue;
+
+                    if (ln.ColorIndex == 3 && ln.Linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase))
+                    {
+                        lineList.Add(ln);
+                    }
+                }
+
+                // Tìm các cặp điểm gần nhau và nối lại
+                int addedCount = 0;
+                for (int i = 0; i < lineList.Count; i++)
+                {
+                    for (int j = i + 1; j < lineList.Count; j++)
+                    {
+                        var l1 = lineList[i];
+                        var l2 = lineList[j];
+
+                        // So sánh 4 tổ hợp điểm đầu/cuối
+                        Point3d[] pts1 = { l1.StartPoint, l1.EndPoint };
+                        Point3d[] pts2 = { l2.StartPoint, l2.EndPoint };
+
+                        foreach (var p1 in pts1)
+                        {
+                            foreach (var p2 in pts2)
+                            {
+                                if (p1.DistanceTo(p2) <= gapTolerance && !p1.IsEqualTo(p2, new Tolerance(0.001, 0.001)))
+                                {
+                                    Line newLine = new Line(p1, p2);
+
+                                    btr.AppendEntity(newLine);
+                                    tr.AddNewlyCreatedDBObject(newLine, true);
+                                    newLine.ColorIndex = 3; // màu khác để dễ nhận biết
+                                    newLine.Linetype = "Continuous";
+                                    //lineList.Add(newLine);
+                                    addedCount++;
+                                }
+                            }
+                        }
+                    }
+                }
+                MergeColinearConnectedLines(tr, lineList, gapTolerance);
+                tr.Commit();
+            }
+        }
+
+        //noi 2 line canh nhau, cung phuong lai thanh 1 line
+        public static void MergeColinearConnectedLines(Transaction tr, List<Line> lineList, double tolerance = 0.1)
+        {
+            bool merged;
+
+            do
+            {
+                merged = false;
+
+                // Làm việc với danh sách các line còn sống (chưa bị Erase)
+                var validLines = lineList.Where(l => !l.IsErased && l.IsWriteEnabled).ToList();
+
+                for (int i = 0; i < validLines.Count; i++)
+                {
+                    Line l1 = validLines[i];
+
+                    for (int j = i + 1; j < validLines.Count; j++)
+                    {
+                        Line l2 = validLines[j];
+
+                        // Kiểm tra xem có điểm nối nào trùng không?
+                        Point3d[] pts1 = { l1.StartPoint, l1.EndPoint };
+                        Point3d[] pts2 = { l2.StartPoint, l2.EndPoint };
+
+                        foreach (Point3d p1 in pts1)
+                        {
+                            foreach (Point3d p2 in pts2)
+                            {
+                                if (p1.IsEqualTo(p2, new Tolerance(tolerance, tolerance)))
+                                {
+                                    // Kiểm tra hướng song song
+                                    Vector3d dir1 = (l1.EndPoint - l1.StartPoint).GetNormal();
+                                    Vector3d dir2 = (l2.EndPoint - l2.StartPoint).GetNormal();
+
+                                    // Hướng giống hoặc ngược nhau (phụ thuộc mục đích)
+                                    if (Math.Abs(dir1.DotProduct(dir2)) > 0.999)
+                                    {
+                                        // Tìm 2 đầu mút xa nhau nhất không trùng
+                                        Point3d pt1 = pts1.First(pt => !pt.IsEqualTo(p1, new Tolerance(tolerance, tolerance)));
+                                        Point3d pt2 = pts2.First(pt => !pt.IsEqualTo(p2, new Tolerance(tolerance, tolerance)));
+
+                                        // Tạo đoạn nối mới
+                                        Line newLine = new Line(pt1, pt2)
+                                        {
+                                            Layer = l1.Layer,
+                                            Color = l1.Color,
+                                            Linetype = l1.Linetype
+                                        };
+
+                                        // Thêm vào model
+                                        BlockTableRecord btr = (BlockTableRecord)tr.GetObject(l1.OwnerId, OpenMode.ForWrite);
+                                        btr.AppendEntity(newLine);
+                                        tr.AddNewlyCreatedDBObject(newLine, true);
+
+                                        // Xóa 2 đoạn cũ
+                                        l1.UpgradeOpen(); l1.Erase();
+                                        l2.UpgradeOpen(); l2.Erase();
+
+                                        // Thêm đoạn mới vào list để tiếp tục merge
+                                        lineList.Add(newLine);
+
+                                        merged = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (merged) break;
+                        }
+                        if (merged) break;
+                    }
+                    if (merged) break;
+                }
+
+            } while (merged); // Tiếp tục cho đến khi không thể gộp thêm
+        }
+
+        //dim phuong X
+        public void CreateDimensionX(Point3d p1, Point3d p2, double offset, Transaction tr, Database db)
+        {
+            //set dimstyle mac dinh
+            DimStyleTable dimTable = tr.GetObject(db.DimStyleTableId, OpenMode.ForRead) as DimStyleTable;
+            if (dimTable.Has("DIMSTYEX_2"))
+            {
+                ObjectId dimStyleId = dimTable["DIMSTYEX_2"];
+                DimStyleTableRecord dimStyleRec = tr.GetObject(dimStyleId, OpenMode.ForRead) as DimStyleTableRecord;
+
+                db.Dimstyle = dimStyleId;
+                db.SetDimstyleData(dimStyleRec);
+            }
+
+            // Tính điểm ghi kích thước (trên phương Y, offset lên)
+            Point3d dimLinePoint = new Point3d((p1.X + p2.X) / 2, Math.Max(p1.Y, p2.Y) + offset, 0);
+
+            // Tạo đối tượng kích thước (AlignedDimension hoặc RotatedDimension)
+            RotatedDimension dim = new RotatedDimension
+            {
+                Rotation = 0,// Góc xoay 0 độ (phương ngang X)
+
+                // Hai điểm cần đo
+                XLine1Point = p1,
+                XLine2Point = p2,
+                DimLinePoint = dimLinePoint,// Vị trí ghi kích thước
+                DimensionStyle = db.Dimstyle// Sử dụng kiểu dimension hiện tại
+            };
+
+            // Mở modelspace để ghi đối tượng
+            BlockTable bt = tr.GetObject(db.BlockTableId, OpenMode.ForRead) as BlockTable;
+            BlockTableRecord model = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+            model.AppendEntity(dim);
+            tr.AddNewlyCreatedDBObject(dim, true);
+        }
+
+        //dim phuong Y
+        public void CreateDimensionY(Point3d p1,Point3d p2,double offset,Transaction tr,Database db)
+        {
+            //set dimstyle mac dinh
+            DimStyleTable dimTable = tr.GetObject(db.DimStyleTableId, OpenMode.ForRead) as DimStyleTable;
+            if (dimTable.Has("DIMSTYEX_2"))
+            {
+                ObjectId dimStyleId = dimTable["DIMSTYEX_2"];
+                DimStyleTableRecord dimStyleRec = tr.GetObject(dimStyleId, OpenMode.ForRead) as DimStyleTableRecord;
+
+                db.Dimstyle = dimStyleId;
+                db.SetDimstyleData(dimStyleRec);
+            }
+
+            // Tính điểm ghi kích thước (trên phương X, offset sang phải)
+            Point3d dimLinePoint = new Point3d(Math.Max(p1.X, p2.X) + offset, (p1.Y + p2.Y) / 2, 0);
+
+            // Tạo kích thước kiểu Rotated (góc 90 độ = phương Y)
+            RotatedDimension dim = new RotatedDimension
+            {
+                Rotation = Math.PI / 2, // 90 độ, đơn vị radian
+
+                XLine1Point = p1,
+                XLine2Point = p2,
+                DimLinePoint = dimLinePoint,
+                DimensionStyle = db.Dimstyle
+            };
+            // Ghi vào modelspace
+            BlockTable bt = tr.GetObject(db.BlockTableId, OpenMode.ForRead) as BlockTable;
+            BlockTableRecord model = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+            model.AppendEntity(dim);
+            tr.AddNewlyCreatedDBObject(dim, true);
+        }
+
+
+        #endregion
+    }
+}
