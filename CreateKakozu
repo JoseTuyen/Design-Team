@@ -1,0 +1,288 @@
+using DocumentFormat.OpenXml.Drawing.Diagrams;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LazerLabel.Kaisaki
+{
+    public class CreateKakoZu
+    {
+        [CommandMethod("K4_CreateKakoZu")]
+        public void KakoZu()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<Polyline> polyList = new List<Polyline>();
+
+            #region tao bo loc
+            //dinh nghia bo loc
+            TypedValue[] typeValArr = new TypedValue[2];
+            typeValArr.SetValue(new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"), 0);
+            typeValArr.SetValue(new TypedValue((int)DxfCode.LayerName, layName), 1);
+
+            //tao bo loc
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable blTb = tr.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                #region lay cac polyline
+                promSeRes = doc.Editor.GetSelection(selectFil);
+                if (promSeRes.Status == PromptStatus.OK)
+                {
+                    SelectionSet selSet = promSeRes.Value;
+                    foreach (SelectedObject selObj in selSet)
+                    {
+                        Polyline pl = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Polyline;
+                        if (pl != null)
+                        {
+                            polyList.Add(pl);
+                        }
+                    }
+                }
+                #endregion
+
+                #region duyet qua tung polyline va lay list cac net dut
+                if (polyList.Count == 0)
+                {
+                    return;
+                }
+
+                foreach (Polyline pl in polyList)
+                {
+                    // Lấy phạm vi của Polyline, Mở rộng mỗi chiều 20mm
+                    Extents3d plExt = pl.GeometricExtents;
+                    double offset = 20.0;
+                    Point3d winMin = new Point3d(plExt.MinPoint.X - offset, plExt.MinPoint.Y - offset, 0);
+                    Point3d winMax = new Point3d(plExt.MaxPoint.X + offset, plExt.MaxPoint.Y + offset, 0);
+
+                    #region tao Mtext
+                    // Tính tọa độ mới cho MText
+                    Point3d newPosition = new Point3d(winMin.X, winMax.Y + 140, 0);
+
+                    // Tạo filter để tìm MText
+                    TypedValue[] mtextFilter = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "MTEXT")
+                    };
+                    SelectionFilter filter = new SelectionFilter(mtextFilter);
+
+                    // Chọn tất cả MTEXT nằm trong bounding box của Polyline
+                    PromptSelectionResult selMtextRes = ed.SelectWindow(winMin, winMax, filter);
+                    if (selMtextRes.Status != PromptStatus.OK) continue;
+
+                    foreach (SelectedObject selObj in selMtextRes.Value)
+                    {
+                        MText mtext = tr.GetObject(selObj.ObjectId, OpenMode.ForWrite) as MText;
+                        if (mtext != null)
+                        {
+                            mtext.Location = newPosition;// Di chuyển đến vị trí mới
+                            mtext.TextHeight = 35;// Thay đổi chiều cao chữ
+                            mtext.ColumnWidth = 350;// Thay đổi chiều rộng cột
+                        }
+                    }
+                    #endregion
+
+                    #region Lấy tất cả LINE trong vùng, không phải Continuous
+                    TypedValue[] filterList = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "LINE")
+                    };
+                    SelectionFilter lineFilter = new SelectionFilter(filterList);
+
+                    PromptSelectionResult lineSelRes = ed.SelectWindow(winMin, winMax, lineFilter);
+                    if (lineSelRes.Status != PromptStatus.OK) continue;
+
+                    List<Line> candidateLines = new List<Line>();
+                    LayerTable lt = tr.GetObject(dat.LayerTableId, OpenMode.ForRead) as LayerTable;
+
+                    foreach (SelectedObject selObj in lineSelRes.Value)
+                    {
+                        Line line = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Line;
+                        if (line != null)
+                        {
+                            string linetypeName = line.Linetype;
+                            if (linetypeName == "ByLayer" && lt.Has(line.Layer))
+                            {
+                                LayerTableRecord layer = tr.GetObject(lt[line.Layer], OpenMode.ForRead) as LayerTableRecord;
+                                LinetypeTableRecord ltr = tr.GetObject(layer.LinetypeObjectId, OpenMode.ForRead) as LinetypeTableRecord;
+                                if (ltr != null) linetypeName = ltr.Name;
+                            }
+
+                            if (!linetypeName.Equals("Continuous", StringComparison.OrdinalIgnoreCase))
+                            {
+                                candidateLines.Add(line);
+                            }
+                        }
+                    }
+                    #endregion
+
+                    if (candidateLines.Count == 0)
+                    { 
+                        return;
+                    }
+                    // Tìm các cặp line cùng phương và gần nhau (<=20)
+                    for (int i = 0; i < candidateLines.Count; i++)
+                    {
+                        for (int j = i + 1; j < candidateLines.Count; j++)
+                        {
+                            Line l1 = candidateLines[i];
+                            Line l2 = candidateLines[j];
+
+                            Vector3d dir1 = (l1.EndPoint - l1.StartPoint).GetNormal();
+                            Vector3d dir2 = (l2.EndPoint - l2.StartPoint).GetNormal();
+
+                            if (!dir1.IsParallelTo(dir2, new Tolerance(1e-6, 1e-6))) continue;
+
+                            // Tính khoảng cách gần nhất giữa 2 line
+                            double dist = l1.GetClosestPointTo(l2.StartPoint, false).DistanceTo(l2.StartPoint);
+                            if (dist > 20) continue;
+
+                            // Tạo text nội dung
+                            string A = (l1.ColorIndex == 7 || l2.ColorIndex == 7) ? "オモテ" : "ウラ";
+                            string B = Math.Round(dist, 1).ToString();
+                            string textContent = $"{A} {B}ミリ";
+
+                            // Chọn 1 trong 2 line để xét trung điểm
+                            Line baseLine = l1;
+                            Point3d mid = new Point3d((baseLine.StartPoint.X + baseLine.EndPoint.X) / 2,(baseLine.StartPoint.Y + baseLine.EndPoint.Y) / 2,0);
+
+                            // So sánh với winMin và winMax
+                            double yMax = plExt.MaxPoint.Y;
+                            double yMin = plExt.MinPoint.Y;
+                            double xMax = plExt.MaxPoint.X;
+                            double xMin = plExt.MinPoint.X;
+
+                            Point3d textPosition = Point3d.Origin;
+
+                            #region vi tri tuong doi cua text
+                            if (Math.Abs(mid.Y - yMax) < 20)//text nam tren
+                            {
+                                textPosition = new Point3d(mid.X + 40, yMax + 60, 0);
+                                Point3d p1 = new Point3d(textPosition.X,textPosition.Y-5,0);
+                                Point3d p2 = new Point3d(textPosition.X+textContent.Length*24, textPosition.Y - 5, 0);
+                                CreateLeader(mid,p1,p2,tr,dat);
+                            }
+                            else if (Math.Abs(mid.Y - yMin) < 20)//text nam duoi
+                            {
+                                textPosition = new Point3d(mid.X + 120, yMin - 140, 0);
+                                Point3d p1 = new Point3d(textPosition.X-5, textPosition.Y - 5, 0);
+                                Point3d p2 = new Point3d(textPosition.X + textContent.Length * 24, textPosition.Y - 5, 0);
+                                CreateLeader(new Point3d(mid.X+30,mid.Y,0), p1, p2,tr, dat);
+                            }
+                            else if (Math.Abs(mid.X - xMin) < 20)//text nam ben trai
+                            {
+                                textPosition = new Point3d(mid.X - 80, yMin - 50, 0);
+                                Point3d p1 = new Point3d(textPosition.X + 5, textPosition.Y - 5, 0);
+                                Point3d p2 = new Point3d(textPosition.X - textContent.Length * 24, textPosition.Y - 5, 0);
+                                CreateLeader(mid, p1, p2,tr, dat);
+                            }
+                            else if (Math.Abs(mid.X - xMax) < 20)//text nam ben phai
+                            {
+                                textPosition = new Point3d(mid.X + 50, yMax - 50, 0);
+                                Point3d p1 = new Point3d(textPosition.X, textPosition.Y - 5, 0);
+                                Point3d p2 = new Point3d(textPosition.X + textContent.Length * 24, textPosition.Y - 5, 0);
+                                CreateLeader(mid, p1, p2,tr, dat);
+                            }
+                            else
+                            {
+                                continue; // Không phù hợp, bỏ qua
+                            }
+                            #endregion
+
+                            // Tạo DBText
+                            if (Math.Abs(mid.X - xMin) < 20)//canh le phai
+                            {
+                                DBText dbtext = new DBText
+                                {
+                                    TextString = textContent,
+                                    Height = 30,
+                                    Position = textPosition,
+                                    HorizontalMode = TextHorizontalMode.TextRight,
+                                    VerticalMode = TextVerticalMode.TextBottom,
+                                    AlignmentPoint = textPosition,
+                                    WidthFactor = 0.7
+                                };
+                                dbtext.SetDatabaseDefaults();
+                                dbtext.AdjustAlignment(dat);
+
+                                blTbRec.AppendEntity(dbtext);
+                                tr.AddNewlyCreatedDBObject(dbtext, true);
+                            }
+                            else//canh le trai
+                            {
+                                DBText dbtext = new DBText
+                                {
+                                    TextString = textContent,
+                                    Height = 30,
+                                    Position = textPosition,
+                                    HorizontalMode = TextHorizontalMode.TextLeft,
+                                    VerticalMode = TextVerticalMode.TextBottom,
+                                    AlignmentPoint = textPosition,
+                                    WidthFactor = 0.7
+                                };
+                                dbtext.SetDatabaseDefaults();
+                                dbtext.AdjustAlignment(dat);
+
+                                blTbRec.AppendEntity(dbtext);
+                                tr.AddNewlyCreatedDBObject(dbtext, true);
+                            }
+
+                        }
+                    }
+                }
+                #endregion
+
+                tr.Commit();
+            }
+        }
+
+        #region Ham dung chung
+        //tao leader
+        public void CreateLeader(Point3d start,Point3d? optionalBendPoint,Point3d end,Transaction tr,Database db)
+        {
+            // Lấy BlockTableRecord (ModelSpace) từ database
+            BlockTable bt = tr.GetObject(db.BlockTableId, OpenMode.ForRead) as BlockTable;
+            BlockTableRecord btr = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+            DimStyleTable dimTable = tr.GetObject(db.DimStyleTableId, OpenMode.ForRead) as DimStyleTable;
+            if (dimTable.Has("DIMSTYEX_2"))
+            {
+                ObjectId dimStyleId = dimTable["DIMSTYEX_2"];
+                DimStyleTableRecord dimStyleRec = tr.GetObject(dimStyleId, OpenMode.ForRead) as DimStyleTableRecord;
+
+                db.Dimstyle = dimStyleId;
+                db.SetDimstyleData(dimStyleRec);
+            }
+
+            Leader leader = new Leader();
+            leader.SetDatabaseDefaults(db);
+            leader.HasArrowHead = true;
+
+            // Thêm điểm vào leader
+            leader.AppendVertex(start);
+            if (optionalBendPoint.HasValue) leader.AppendVertex(optionalBendPoint.Value);
+            leader.AppendVertex(end);
+
+            // Thêm vào bản vẽ
+            btr.AppendEntity(leader);
+            tr.AddNewlyCreatedDBObject(leader, true);
+        }
+
+        #endregion
+    }
+}
