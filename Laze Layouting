@@ -1,0 +1,222 @@
+using DocumentFormat.OpenXml.Office2016.Drawing.ChartDrawing;
+using DocumentFormat.OpenXml.Spreadsheet;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LazerLabel.Layout
+{
+    public class Layout
+    {
+        [CommandMethod("LL5_LazeLayouting")]
+        public void Layouting()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            List<(Polyline pl, Extents3d ext)> plInfos = new List<(Polyline, Extents3d)>();
+            List<Polyline> sortedPolyList = new List<Polyline>();
+
+            #region Bộ lọc polyline theo layer
+            TypedValue[] typeValArr = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"),
+                new TypedValue((int)DxfCode.LayerName, layName)
+            };
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            #region Chọn polyline
+            PromptSelectionResult promSeRes = ed.GetSelection(selectFil);
+            if (promSeRes.Status != PromptStatus.OK) return;
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                SelectionSet selectSet = promSeRes.Value;
+                foreach (SelectedObject selObj in selectSet)
+                {
+                    Entity ent = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                    if (ent is Polyline pl)
+                        plInfos.Add((pl, pl.GeometricExtents));
+                }
+                tr.Commit();
+            }
+            #endregion
+
+            #region gom nhom va sap xep polyline
+            // Gom nhóm theo Y, sắp xếp theo X
+            double yThreshold = 500.0;
+            var sortedByY = plInfos.OrderByDescending(info => info.ext.MinPoint.Y).ToList();
+            List<List<(Polyline, Extents3d)>> groups = new List<List<(Polyline, Extents3d)>>();
+            List<(Polyline, Extents3d)> currentGroup = new List<(Polyline, Extents3d)>();
+            double? currentY = null;
+
+            foreach (var info in sortedByY)
+            {
+                double y = info.ext.MinPoint.Y;
+                if (currentY == null || Math.Abs(y - currentY.Value) <= yThreshold)
+                {
+                    currentGroup.Add(info);
+                    if (currentY == null) currentY = y;
+                }
+                else
+                {
+                    groups.Add(currentGroup);
+                    currentGroup = new List<(Polyline, Extents3d)> { info };
+                    currentY = y;
+                }
+            }
+            if (currentGroup.Any()) groups.Add(currentGroup);
+
+            // Tạo danh sách polyline đã sắp xếp theo nhóm từ trái sang phải
+            sortedPolyList = groups
+                .SelectMany(g => g.OrderBy(p => p.Item2.MinPoint.X).Select(p => p.Item1))
+                .ToList();
+            #endregion
+
+            // ===== Bắt đầu bố trí theo lưới =====
+            #region chon diem bo tri
+            PromptPointOptions ppo = new PromptPointOptions("\n配置する点を選択してください!!! ");
+            PromptPointResult ppr = ed.GetPoint(ppo);
+            if (ppr.Status != PromptStatus.OK)
+            {
+                return;
+            }
+
+            Point3d basePoint = ppr.Value; // ← Gán điểm người dùng chọn
+            #endregion
+
+            using (Transaction tr2 = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = tr2.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord btr = tr2.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                int maxCols = 10;
+                double offsetX = 100.0;
+                double offsetY = 100.0;
+                Point3d currentPos = basePoint;
+
+                #region Tính chiều cao đã điều chỉnh của từng hàng
+                List<double> adjustedHeightsPerRow = new List<double>();
+                for (int i = 0; i < sortedPolyList.Count; i += maxCols)
+                {
+                    var group = sortedPolyList.Skip(i).Take(maxCols);
+                    double maxAdjustedHeight = 0;
+                    foreach (Polyline pl in group)
+                    {
+                        Extents3d ext = pl.GeometricExtents;
+                        double width = ext.MaxPoint.X - ext.MinPoint.X;
+                        double height = ext.MaxPoint.Y - ext.MinPoint.Y;
+                        bool shouldRotate = (height > 1.5 * width && width <= 250);
+                        double adjustedHeight = shouldRotate ? width : height;
+                        maxAdjustedHeight = Math.Max(maxAdjustedHeight, adjustedHeight);
+                    }
+                    adjustedHeightsPerRow.Add(maxAdjustedHeight);
+                }
+                #endregion
+
+                #region Bố trí từng nhóm
+                for (int i = 0; i < sortedPolyList.Count; i += maxCols)
+                {
+                    var group = sortedPolyList.Skip(i).Take(maxCols).ToList();
+                    double thisRowHeight = adjustedHeightsPerRow[i / maxCols];
+
+                    Point3d localPos = currentPos;
+
+                    foreach (Polyline pl in group)
+                    {
+                        Extents3d ext = pl.GeometricExtents;
+                        double delta = 40.0;
+                        Point3d winMin = new Point3d(ext.MinPoint.X - delta, ext.MinPoint.Y - delta, 0);
+                        Point3d winMax = new Point3d(ext.MaxPoint.X + delta, ext.MaxPoint.Y + delta, 0);
+                        Point3d baseMin = ext.MinPoint;
+                        Point3d rotateBase = new Point3d(ext.MaxPoint.X, ext.MinPoint.Y, 0);
+
+                        double width = ext.MaxPoint.X - ext.MinPoint.X;
+                        double height = ext.MaxPoint.Y - ext.MinPoint.Y;
+                        bool shouldRotate = (height > 1.5 * width && width <= 250);
+                        double adjustedHeight = shouldRotate ? width : height;
+                        double adjustedWidth = shouldRotate ? height : width;
+
+                        #region Lấy các đối tượng nằm trong polyline
+                        List<Entity> toInsert = new List<Entity>();
+                        PromptSelectionResult selRes = ed.SelectWindow(winMin, winMax);
+                        if (selRes.Status == PromptStatus.OK)
+                        {
+                            foreach (SelectedObject selObj in selRes.Value)
+                            {
+                                Entity ent = tr2.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                                if (ent != null)
+                                    toInsert.Add(ent.Clone() as Entity);
+                            }
+                        }
+                        #endregion
+
+                        #region Move cac doi tuong
+                        Matrix3d moveMatrix = Matrix3d.Displacement(localPos - baseMin);
+                        foreach (Entity copiedEnt in toInsert)
+                        {
+                            copiedEnt.TransformBy(moveMatrix);
+                        }
+                        #endregion
+
+                        #region Xoay nếu cần
+                        if (shouldRotate)
+                        {
+                            Point3d newRotateBase = rotateBase.Add(localPos - baseMin);
+                            Matrix3d rotateMatrix = Matrix3d.Rotation(-Math.PI / 2, Vector3d.ZAxis, newRotateBase);
+
+                            foreach (Entity copiedEnt in toInsert)
+                            {
+                                if (!(copiedEnt is DBText) && !(copiedEnt is MText))
+                                {
+                                    copiedEnt.TransformBy(rotateMatrix);
+                                }
+                            }
+
+                            // Sau xoay, move thêm để điều chỉnh lại từ P1 về minPoint
+                            Vector3d adjustVec = baseMin - rotateBase;
+                            foreach (Entity copiedEnt in toInsert)
+                            {
+                                if (!(copiedEnt is DBText) && !(copiedEnt is MText))
+                                {
+                                    copiedEnt.TransformBy(Matrix3d.Displacement(adjustVec));
+                                }
+                            }
+                        }
+                        #endregion
+
+                        // Thêm vào bản vẽ
+                        foreach (Entity copiedEnt in toInsert)
+                        {
+                            btr.AppendEntity(copiedEnt);
+                            tr2.AddNewlyCreatedDBObject(copiedEnt, true);
+                        }
+
+                        // Cập nhật vị trí tiếp theo trong hàng
+                        localPos = new Point3d(localPos.X + adjustedWidth + offsetX, localPos.Y, 0);
+                    }
+
+                    // Nếu còn hàng tiếp theo thì cập nhật vị trí
+                    if (i + maxCols < sortedPolyList.Count)
+                    {
+                        double nextRowHeight = adjustedHeightsPerRow[(i / maxCols) + 1];
+                        currentPos = new Point3d(basePoint.X, currentPos.Y - nextRowHeight - offsetY, 0);
+                    }
+                }
+                #endregion
+
+                tr2.Commit();
+            }
+        }
+    }
+}
