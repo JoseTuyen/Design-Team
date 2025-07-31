@@ -1,0 +1,233 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.LayerManager;
+using Teigha.Runtime;
+using Teigha.Windows;
+using System.Windows.Forms;
+using Teigha.ApplicationServices.Core;
+using Application = Teigha.ApplicationServices.Application;
+using ClosedXML.Excel;
+using Exception = Teigha.Runtime.Exception;
+using DocumentFormat.OpenXml.Wordprocessing;
+using Teigha.Geometry;
+
+namespace LazerLabel.Numbering
+{
+    public class GetDataFromExcel
+    {
+        [CommandMethod("LL0_GetExcelData")]
+        public void GetLazerDataFromExcel()
+        {
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            Teigha.ApplicationServices.Document doc=Application.DocumentManager.MdiActiveDocument;
+            Database dat=doc.Database;
+            Editor ed=doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<(Polyline pl, Extents3d ext)> plInfos = new List<(Polyline, Extents3d)>();
+
+            #region chon file excel
+            // Khởi tạo danh sách
+            List<string> thickList = new List<string>();
+            List<int> countList = new List<int>();
+            List<string> kakoList = new List<string>();
+            List<string> otherList = new List<string>();
+
+            //chon file Excel
+            var dialog = new System.Windows.Forms.OpenFileDialog();
+            dialog.Title = "データのファイルを選択してください!!!";
+            dialog.Filter = "Excel files (*.xlsx)|*.xlsx";
+            #endregion
+
+            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            {
+                string filePath = dialog.FileName;
+
+                try
+                {
+                    using (var workbook = new XLWorkbook(filePath))
+                    {
+                        var ws = workbook.Worksheets.First();
+                        int row = 3;
+
+                        while (true)
+                        {
+                            var cell = ws.Cell(row, 1);
+                            if (cell.IsEmpty()) break;//neu cot A rong thi dung lenh
+
+                            // Cột A: Độ dày
+                            string thickness = ws.Cell(row, 1).GetValue<string>().Trim();
+                            thickList.Add(thickness);
+
+                            // Cột B: Số lượng (nếu trống thì mặc định 1)
+                            var countCell = ws.Cell(row, 2);
+                            int count = 1;
+                            if (!countCell.IsEmpty())
+                            {
+                                int.TryParse(countCell.GetValue<string>().Trim(), out count);
+                                if (count == 0) count = 1;
+                            }
+                            countList.Add(count);
+
+                            // Cột C: Gia công (nếu trống thì thêm "")
+                            string kako = ws.Cell(row, 3).GetValue<string>()?.Trim() ?? "";
+                            kakoList.Add(kako);
+
+                            // Cột D: Ghi chú khác (nếu trống thì thêm "")
+                            string other = ws.Cell(row, 4).GetValue<string>()?.Trim() ?? "";
+                            otherList.Add(other);
+
+                            row++;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ed.WriteMessage($"\nエラー: {ex.Message}");
+                }
+            }
+
+            //chon cac polyline >> chen text vao chinh giua polyline do
+            #region tao bo loc
+            //dinh nghia bo loc
+            TypedValue[] typeValArr = new TypedValue[2];
+            typeValArr.SetValue(new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"), 0);
+            typeValArr.SetValue(new TypedValue((int)DxfCode.LayerName, layName), 1);
+
+            //tao bo loc
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            #region Loc cac polyline
+            //loc doi tuong polyline co layer nhu tren
+            promSeRes = doc.Editor.GetSelection(selectFil);
+            if (promSeRes.Status == PromptStatus.OK)
+            {
+                SelectionSet selectSet = promSeRes.Value;
+                using (Transaction tr1 = doc.TransactionManager.StartTransaction())
+                {
+                    foreach (SelectedObject selObj in selectSet)
+                    {
+                        Entity ent = tr1.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                        if (ent is Polyline pl)
+                        {
+                            plInfos.Add((pl, pl.GeometricExtents));
+                        }
+                    }
+                    tr1.Commit();
+                }
+
+                // Gom nhóm polyline theo Y và sắp theo X trong từng nhóm
+                double yThreshold = 500.0;
+                List<(Polyline pl, Extents3d ext)> sortedPls = new List<(Polyline, Extents3d)>();
+
+                // Sắp theo Y giảm dần, rồi X tăng dần
+                var sortedByY = plInfos
+                    .OrderByDescending(info => info.ext.MinPoint.Y)
+                    .ThenBy(info => info.ext.MinPoint.X)
+                    .ToList();
+
+                // Gom nhóm theo Y threshold
+                List<List<(Polyline pl, Extents3d ext)>> groups = new List<List<(Polyline, Extents3d)>>();
+                List<(Polyline, Extents3d)> currentGroup = new List<(Polyline, Extents3d)>();
+                double? currentY = null;
+
+                foreach (var info in sortedByY)
+                {
+                    double y = info.ext.MinPoint.Y;
+                    if (currentY == null || Math.Abs(y - currentY.Value) <= yThreshold)
+                    {
+                        currentGroup.Add(info);
+                        if (currentY == null)
+                            currentY = y;
+                    }
+                    else
+                    {
+                        groups.Add(currentGroup);
+                        currentGroup = new List<(Polyline, Extents3d)> { info };
+                        currentY = y;
+                    }
+                }
+                if (currentGroup.Any())
+                    groups.Add(currentGroup);
+
+                // Nối lại các nhóm thành danh sách tuần tự đúng: trên xuống, trái sang phải
+                plInfos = groups.SelectMany(g => g.OrderBy(p => p.ext.MinPoint.X)).ToList();
+            }
+            #endregion
+
+            #region tim so doi tuong can danh so
+            int soHangExcel =thickList.Count;
+            int soPolyline=plInfos.Count;
+            int entCount=Math.Min(soHangExcel, soPolyline);
+            #endregion
+
+            if (entCount > 0)
+            {
+                for (int i = 0; i < entCount; i++)
+                { 
+                    string textContent = thickList[i] + "/" + countList[i].ToString() + kakoList[i] + otherList[i];
+                    Point3d basePt = GetCenterOfPolyline(plInfos[i].pl);
+                    CreateDbText(dat,basePt,textContent);
+                }
+            }
+        }
+
+        #region ham dung chung
+        //tim trong tam polyline
+        public static Point3d GetCenterOfPolyline(Polyline pline)
+        {
+            if (pline == null || pline.NumberOfVertices < 2)
+                throw new ArgumentException("Polyline không hợp lệ.");
+
+            // Tính bounding box
+            Extents3d ext = pline.GeometricExtents;
+
+            // Lấy trung điểm của bounding box
+            double centerX = (ext.MinPoint.X + ext.MaxPoint.X) / 2.0;
+            double centerY = (ext.MinPoint.Y + ext.MaxPoint.Y) / 2.0;
+            double centerZ = (ext.MinPoint.Z + ext.MaxPoint.Z) / 2.0;
+
+            return new Point3d(centerX, centerY, centerZ);
+        }
+
+        //them moi DBtext
+        public static void CreateDbText(Database database, Point3d position, string content)
+        {
+            using (Transaction tr = database.TransactionManager.StartTransaction())
+            {
+                // Lấy BlockTable & mở ModelSpace để ghi
+                BlockTable blTb = (BlockTable)tr.GetObject(database.BlockTableId, OpenMode.ForRead);
+                BlockTableRecord blTbRec = (BlockTableRecord)tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                // Tạo DBText
+                DBText text = new DBText
+                {
+                    Position = position,
+                    TextString = content,
+                    Height = 8,
+                    HorizontalMode = TextHorizontalMode.TextMid,
+                    VerticalMode = TextVerticalMode.TextBase,
+                    AlignmentPoint = position,
+                    Layer = "Polyline_Temp",
+                    TextStyleId = database.Textstyle
+                };
+
+                // Thêm vào model space
+                blTbRec.AppendEntity(text);
+                tr.AddNewlyCreatedDBObject(text, true);
+
+                tr.Commit();
+            }
+        }
+
+        #endregion
+    }
+}
