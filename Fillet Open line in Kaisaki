@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LazerLabel.Kaisaki
+{
+    public class FilletOpenedLine
+    {
+        [CommandMethod("K2_FilletOpendLinesByR0")]
+        public void FilletOpendLinesByR0()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<Polyline> polyList = new List<Polyline>();
+
+            #region tao bo loc
+            //dinh nghia bo loc
+            TypedValue[] typeValArr = new TypedValue[2];
+            typeValArr.SetValue(new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"), 0);
+            typeValArr.SetValue(new TypedValue((int)DxfCode.LayerName, layName), 1);
+
+            //tao bo loc
+            SelectionFilter selectFil = new SelectionFilter(typeValArr);
+            #endregion
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable blTb = tr.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                #region lay cac polyline
+                promSeRes = doc.Editor.GetSelection(selectFil);
+                if (promSeRes.Status == PromptStatus.OK)
+                {
+                    SelectionSet selSet = promSeRes.Value;
+                    foreach (SelectedObject selObj in selSet)
+                    {
+                        Polyline pl = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Polyline;
+                        if (pl != null)
+                        {
+                            polyList.Add(pl);
+                        }
+                    }
+                }
+                #endregion
+
+                foreach (Polyline pl in polyList)
+                {
+                    bool containsKeyword = false;
+                    Extents3d ext = pl.GeometricExtents;
+
+                    // Xét tất cả MText xem có chua ki tu can di chuyen
+                    foreach (ObjectId objId in blTbRec)
+                    {
+                        if (objId.ObjectClass.DxfName == "MTEXT")
+                        {
+                            MText mt = tr.GetObject(objId, OpenMode.ForRead) as MText;
+                            if (mt != null)
+                            {
+                                // Kiểm tra vị trí mtext nằm trong extents polyline
+                                if (ext.MinPoint.X - 20 <= mt.Location.X && mt.Location.X <= ext.MaxPoint.X + 20 &&
+                                    ext.MinPoint.Y - 20 <= mt.Location.Y && mt.Location.Y <= ext.MaxPoint.Y + 20)
+                                {
+                                    if (mt.Contents.Contains("開") || mt.Contents.Contains("プ"))
+                                    {
+                                        containsKeyword = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!containsKeyword)
+                        continue;
+
+                    // Tạo vùng mở rộng 20mm mỗi hướng
+                    double delta = 20.0;
+                    Point3d winMin = new Point3d(ext.MinPoint.X - delta, ext.MinPoint.Y - delta, 0);
+                    Point3d winMax = new Point3d(ext.MaxPoint.X + delta, ext.MaxPoint.Y + delta, 0);
+
+                    // Tìm các line có màu xanh trong vùng mở rộng
+                    List<Line> openedLineList = new List<Line>();
+                    TypedValue[] filterVals = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "LINE")
+                    };
+                    SelectionFilter lineFilter = new SelectionFilter(filterVals);
+                    PromptSelectionResult lineSelRes = ed.SelectWindow(winMin, winMax, lineFilter);
+                    if (lineSelRes.Status != PromptStatus.OK) continue;
+
+                    SelectionSet lineSet = lineSelRes.Value;
+                    foreach (SelectedObject selObj in lineSet)
+                    {
+                        Line ln = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Line;
+                        Point3d ptMid = ln.StartPoint + 0.5 * (ln.EndPoint - ln.StartPoint);
+                        if (ln.ColorIndex == 3 && IsInBetweenWindows(ptMid, ext.MinPoint, ext.MaxPoint, winMin, winMax))
+                        {
+                            openedLineList.Add(ln);
+                        }
+                    }
+
+                    #region Nếu có >=2 line thì fillet R=0 nếu đầu gần nhau
+                    if (openedLineList.Count > 1)
+                    {
+                        for (int i = 0; i < openedLineList.Count - 1; i++)
+                        {
+                            for (int j = i + 1; j < openedLineList.Count; j++)
+                            {
+                                Line l1 = openedLineList[i];
+                                Line l2 = openedLineList[j];
+
+                                Point3d[] pts1 = { l1.StartPoint, l1.EndPoint };
+                                Point3d[] pts2 = { l2.StartPoint, l2.EndPoint };
+
+                                foreach (var p1 in pts1)
+                                {
+                                    foreach (var p2 in pts2)
+                                    {
+                                        if (p1.DistanceTo(p2) < 1.0)
+                                        {
+                                            l1.UpgradeOpen(); l2.UpgradeOpen();
+                                            FilletR0Lines(tr, l1, l2, blTbRec);
+                                            goto NextPair;
+                                        }
+                                    }
+                                }
+                            NextPair:;
+                            }
+                        }
+                    }
+                    #endregion
+                }
+                tr.Commit();
+            }
+        }
+
+        #region ham dung chung
+        // Hàm fillet R=0 thủ công (tính giao điểm và vẽ 2 đoạn mới)
+        private void FilletR0Lines(Transaction tr, Line l1, Line l2, BlockTableRecord btr)
+        {
+            if (l1 == null || l2 == null || l1.IsErased || l2.IsErased) return;
+
+            Line ln1 = l1.Clone() as Line;
+            Line ln2 = l2.Clone() as Line;
+
+            if (ln1 == null || ln2 == null) return;
+
+            Vector3d dir1 = ln1.Delta.GetNormal();
+            Vector3d dir2 = ln2.Delta.GetNormal();
+
+            Point3d p1 = ln1.StartPoint;
+            Point3d p2 = ln2.StartPoint;
+
+            // Tính giao điểm thủ công từ 2 đường thẳng
+            bool success = LineLineIntersection(p1, dir1, p2, dir2, out Point3d interPt);
+            if (!success) return;
+
+            // Xác định đầu gần với giao điểm
+            Point3d p1_near = (ln1.StartPoint.DistanceTo(interPt) < ln1.EndPoint.DistanceTo(interPt))
+                ? ln1.StartPoint : ln1.EndPoint;
+
+            Point3d p2_near = (ln2.StartPoint.DistanceTo(interPt) < ln2.EndPoint.DistanceTo(interPt))
+                ? ln2.StartPoint : ln2.EndPoint;
+
+            // Vẽ 2 đoạn mới nối về interPt
+            Line new1 = new Line(p1_near, interPt);
+            Line new2 = new Line(p2_near, interPt);
+            new1.ColorIndex = 3;//color=green
+            new2.ColorIndex = 3;//color=green
+
+            btr.AppendEntity(new1); tr.AddNewlyCreatedDBObject(new1, true);
+            btr.AppendEntity(new2); tr.AddNewlyCreatedDBObject(new2, true);
+        }
+
+
+        // Tính giao điểm của 2 đường thẳng từ điểm + vector hướng
+        private bool LineLineIntersection(Point3d p1, Vector3d d1, Point3d p2, Vector3d d2, out Point3d result)
+        {
+            result = Point3d.Origin;
+            Vector3d dp = p2 - p1;
+            double cross = d1.X * d2.Y - d1.Y * d2.X;
+            if (Math.Abs(cross) < 1e-6) return false; // song song
+
+            double t = (dp.X * d2.Y - dp.Y * d2.X) / cross;
+            result = p1 + t * d1;
+            return true;
+        }
+
+        //xet line nam giua 2 cua so
+        bool IsInBetweenWindows(Point3d pt, Point3d innerMin, Point3d innerMax, Point3d outerMin, Point3d outerMax)
+        {
+            return
+                pt.X > outerMin.X && pt.X < outerMax.X && pt.Y > outerMin.Y && pt.Y < outerMax.Y &&
+                !(pt.X >= innerMin.X && pt.X <= innerMax.X && pt.Y >= innerMin.Y && pt.Y <= innerMax.Y);
+        }
+
+
+        #endregion
+    }
+}
