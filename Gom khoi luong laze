@@ -1,0 +1,173 @@
+using ClosedXML.Excel;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LaserWeight.LaserCalculate
+{
+    public class GomKhoiLuong
+    {
+        [CommandMethod("M3_JuRyouMatome")]
+        public static void JuuRyouMatome()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string LayName = "12";
+            #region bo loc
+            // 1.Hỏi người dùng chọn polyline thuoc layer chỉ định
+            var tvs = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"),
+                new TypedValue((int)DxfCode.LayerName, LayName)
+            };
+            var selFilter = new SelectionFilter(tvs);
+            var opts = new PromptSelectionOptions
+            {
+                MessageForAdding = $"\n部材を選択してください:"
+            };
+
+            var selRes = ed.GetSelection(opts, selFilter);
+            if (selRes.Status != PromptStatus.OK)
+            {
+                ed.WriteMessage("\n有効なオブジェクトは選択されません!!");
+                return;
+            }
+            #endregion
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                List<double> SumWeight = new List<double>();
+                List<string>buzaiNameList= new List<string>();
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(dat.CurrentSpaceId, OpenMode.ForRead);
+
+                // 1. Lấy danh sách polyline kèm minPoint để sắp xếp
+                var plList = new List<(Polyline pl, Point3d minPt)>();
+                foreach (SelectedObject so in selRes.Value)
+                {
+                    if (so == null) continue;
+                    var pl = tr.GetObject(so.ObjectId, OpenMode.ForRead) as Polyline;
+                    if (pl == null) continue;
+
+                    Extents3d ext = pl.GeometricExtents;
+                    plList.Add((pl, ext.MinPoint));
+                }
+
+                // 2. Sắp xếp theo MinY giảm dần, nếu bằng thì theo MinX tăng dần
+                var sortedPlines = plList
+                    .OrderByDescending(t => t.minPt.Y)
+                    .ThenBy(t => t.minPt.X)
+                    .ToList();
+
+                // 3. Duyệt từng polyline sau khi sắp xếp
+                foreach (var (pl, minPt) in sortedPlines)
+                {
+                    Extents3d ext = pl.GeometricExtents;
+                    Point3d maxPt = ext.MaxPoint;
+                    Point3d minPt1 = new Point3d(minPt.X - 10, minPt.Y - 10, 0);
+                    Point3d maxPt1 = new Point3d(maxPt.X + 10, maxPt.Y + 10, 0);
+
+                    #region tinh tong khoi luong
+                    // Lọc DBText thuộc layer Polyline_Temp
+                    TypedValue[] tvsText = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "TEXT"),
+                        new TypedValue((int)DxfCode.LayerName, "Polyline_Temp")
+                    };
+                    SelectionFilter textFilter = new SelectionFilter(tvsText);
+                    PromptSelectionResult selTexts = ed.SelectCrossingWindow(minPt1, maxPt1, textFilter);
+                    if (selTexts.Status != PromptStatus.OK) continue;
+
+                    double sum = 0;
+                    foreach (SelectedObject txtObj in selTexts.Value)
+                    {
+                        if (txtObj == null) continue;
+                        DBText txt = tr.GetObject(txtObj.ObjectId, OpenMode.ForRead) as DBText;
+                        if (txt == null) continue;
+
+                        if (double.TryParse(txt.TextString, out double val) && val > 0)
+                        {
+                            sum +=Math.Round(val,2);
+                        }
+                    }
+                    // Thêm tổng vào danh sách
+                    SumWeight.Add(sum);
+                    #endregion
+
+                    #region tim text ten cau kien
+                    TypedValue[] tvsText1 = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "TEXT"),
+                    };
+                    SelectionFilter textFilter1 = new SelectionFilter(tvsText1);
+                    PromptSelectionResult selTexts1 = ed.SelectCrossingWindow(minPt1, maxPt1, textFilter1);
+                    if (selTexts1.Status != PromptStatus.OK) continue;
+
+                    foreach (SelectedObject txtObj1 in selTexts1.Value)
+                    {
+                        if (txtObj1 == null) continue;
+                        DBText txt1 = tr.GetObject(txtObj1.ObjectId, OpenMode.ForRead) as DBText;
+                        if (txt1 == null) continue;
+
+                        string noiDung = txt1.TextString;
+                        if (noiDung.Contains("図示") || noiDung.Contains("勝手反対"))
+                        {
+                            buzaiNameList.Add(noiDung);
+                        }
+                    }
+                    #endregion
+                }
+                #region xuat Excel
+                using (var workbook = new XLWorkbook())
+                {
+                    var worksheet1 = workbook.Worksheets.Add("重量集計");
+                    int n = Math.Min(SumWeight.Count,buzaiNameList.Count);
+
+                    worksheet1.Column(1).Width = 70;
+                    worksheet1.Column(2).Width = 15;
+                    worksheet1.Cell(1,1).Value = "枠名／部材名";
+                    worksheet1.Cell(1,2).Value = "重量(kg)";
+
+                    for (int iHang = 2; iHang < n+2; iHang++)
+                    {
+                        worksheet1.Cell(iHang,1).Value = buzaiNameList[iHang - 2];
+                        worksheet1.Cell(iHang,2).Value=SumWeight[iHang - 2];
+                    }
+                    string filePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "重量集計.xlsx");//tao path luu file
+                    workbook.SaveAs(filePath);//luu file excel
+                    OpenExcelFile(filePath);//mo file excel
+                }
+                #endregion
+                tr.Commit();
+            }
+        }
+
+        //open excel file
+        private static void OpenExcelFile(string filePath)
+        {
+            try
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = filePath,
+                    UseShellExecute = true // Sử dụng shell mặc định của hệ điều hành để mở file
+                };
+                Process.Start(startInfo);
+            }
+            catch (System.Exception ex)
+            {
+                Console.WriteLine("Cannot open file excel: " + ex.Message);
+            }
+        }
+    }
+}
