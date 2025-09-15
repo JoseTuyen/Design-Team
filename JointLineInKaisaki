@@ -11,7 +11,7 @@ namespace LazerLabel.Kaisaki
 {
     public class JointLine
     {
-        [CommandMethod("K2_JointLines")]
+        [CommandMethod("K3_JointLines")]
         public void JointClosedLine()
         {
             Document doc = Application.DocumentManager.MdiActiveDocument;
@@ -106,7 +106,7 @@ namespace LazerLabel.Kaisaki
 
                     if (kaisakiLines.Count < 2) return;
 
-                    double tolerance = 0.5;
+                    double tolerance = 0.2;
                     List<Line> remaining = new List<Line>(kaisakiLines);
                     HashSet<ObjectId> processed = new HashSet<ObjectId>();
 
@@ -133,7 +133,7 @@ namespace LazerLabel.Kaisaki
                                 Line candidate = remaining[i];
                                 Vector3d candDir = (candidate.EndPoint - candidate.StartPoint).GetNormal();
 
-                                if (!baseDir.IsParallelTo(candDir, new Tolerance(1e-6, 1e-6))) continue;
+                                if (!baseDir.IsParallelTo(candDir, new Tolerance(0.001, 0.001))) continue;
 
                                 if (tail.DistanceTo(candidate.StartPoint) <= tolerance)
                                 {
