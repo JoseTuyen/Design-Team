@@ -1,3 +1,4 @@
+using LazerLabel.Numbering;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -9,7 +10,8 @@ using Teigha.DatabaseServices;
 using Teigha.EditorInput;
 using Teigha.Geometry;
 using Teigha.Runtime;
-using static LazerLabel.Numbering.LazerNumbering;
+//using static LazerLabel.Numbering.LazerNumbering;
+using static LazerLabel.Numbering.CreatePolyline;
 
 namespace LazerLabel.Kaisaki
 {
@@ -156,7 +158,7 @@ namespace LazerLabel.Kaisaki
                     Point3d winMin = new Point3d(plExt.MinPoint.X - offset, plExt.MinPoint.Y - offset, 0);
                     Point3d winMax = new Point3d(plExt.MaxPoint.X + offset, plExt.MaxPoint.Y + offset, 0);
 
-                    CloseGapLinesInWindow(dat, winMin, winMax, 1);
+                    CloseGapLinesInWindow(dat, winMin, winMax, 0.1);
                 }
                 #endregion
                 tr1.Commit();
@@ -173,7 +175,11 @@ namespace LazerLabel.Kaisaki
             // Tạo filter chọn LINE
             TypedValue[] filterVals = new TypedValue[]
             {
-                new TypedValue((int)DxfCode.Start, "LINE")
+                //new TypedValue((int)DxfCode.Start, "LINE")
+                    new TypedValue((int)DxfCode.Operator, "<AND"),
+                        new TypedValue((int)DxfCode.Start, "LINE"),
+                        new TypedValue((int)DxfCode.Color, 3), // ACI = 3
+                    new TypedValue((int)DxfCode.Operator, "AND>")
             };
             SelectionFilter filter = new SelectionFilter(filterVals);
 
@@ -185,6 +191,10 @@ namespace LazerLabel.Kaisaki
             {
                 SelectionSet selSet = selRes.Value;
                 Vector3d refDir = (refLine.EndPoint - refLine.StartPoint).GetNormal();
+                Point3d midRef = refLine.StartPoint + 0.5 * (refLine.EndPoint - refLine.StartPoint);
+
+                Line bestLine = null;
+                double minDist = double.MaxValue;
 
                 foreach (SelectedObject selObj in selSet)
                 {
@@ -200,23 +210,28 @@ namespace LazerLabel.Kaisaki
                     if (dot < 0.999) continue;
 
                     // Tính khoảng cách vuông góc từ midpoint refLine đến otherLine
-                    Point3d midRef = refLine.StartPoint + 0.5 * (refLine.EndPoint - refLine.StartPoint);
                     Point3d proj = otherLine.GetClosestPointTo(midRef, false);
                     double dist = midRef.DistanceTo(proj);
 
-                    if (dist < 20.0)
+                    if (dist < 20.0 && dist < minDist)
                     {
-                        Line writableOtherLine = tr.GetObject(otherLine.ObjectId, OpenMode.ForWrite) as Line;
-                        if (writableOtherLine != null)
-                        {
-                            writableOtherLine.Layer = refLine.Layer;
-                            writableOtherLine.Color = refLine.Color;
-                            writableOtherLine.Linetype = refLine.Linetype;
-                        }
-
-                        tr.Commit();
-                        return writableOtherLine; // hoặc otherLine cũng được vì cùng ID
+                        bestLine = otherLine;
+                        minDist = dist;
                     }
+                }
+
+                if (bestLine != null)
+                {
+                    // Ghi thuộc tính từ refLine sang bestLine
+                    Line writableBest = tr.GetObject(bestLine.ObjectId, OpenMode.ForWrite) as Line;
+                    if (writableBest != null)
+                    {
+                        writableBest.Layer = refLine.Layer;
+                        writableBest.Color = refLine.Color;
+                        writableBest.Linetype = refLine.Linetype;
+                    }
+                    tr.Commit();
+                    return writableBest;
                 }
 
                 tr.Commit();
@@ -225,65 +240,116 @@ namespace LazerLabel.Kaisaki
         }
 
         //tao line offset cua canh kaisaki
+        //public static Line CreateOffsetLineOpposite(Database db, Line line1, Line line2)
+        //{
+        //    Line resultLine = null;
+
+        //    using (Transaction tr = db.TransactionManager.StartTransaction())
+        //    {
+        //        // Lấy bảng block hiện tại (ModelSpace)
+        //        BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+        //        BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+        //        #region set lai diem start/end cua line2
+        //        Point3d l2_endPt = new Point3d();
+        //        Point3d l2_startPt=new Point3d();
+        //        if (line2.EndPoint.X > line2.StartPoint.X)
+        //        {
+        //            l2_endPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+        //            l2_startPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+        //        }
+        //        else if (line2.EndPoint.X < line2.StartPoint.X)
+        //        {
+        //            l2_startPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+        //            l2_endPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+        //        }
+        //        else//line2.EndPoint.X = line2.StartPoint.X
+        //        {
+        //            if (line2.EndPoint.Y < line2.StartPoint.Y)
+        //            {
+        //                l2_startPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+        //                l2_endPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+        //            }
+        //            else
+        //            {
+        //                l2_endPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
+        //                l2_startPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
+        //            }
+        //        }
+        //        #endregion
+
+        //        // Tính vector pháp tuyến của line2
+        //        Vector3d dir = (l2_endPt - l2_startPt).GetNormal();
+        //        Vector3d normal = dir.RotateBy(Math.PI / 2, Vector3d.ZAxis); // pháp tuyến trái
+
+        //        // Dùng midpoint của line2 để kiểm tra vị trí line1
+        //        Point3d midLine2 = l2_startPt + 0.5 * (l2_endPt - l2_startPt);
+        //        Point3d testPt = midLine2 + normal;
+
+        //        // Đo khoảng cách từ testPt đến line1
+        //        Point3d closest = line1.GetClosestPointTo(testPt, false);
+        //        double distPositive = testPt.DistanceTo(closest);
+
+        //        // Nếu pháp tuyến đang hướng về phía line1 thì đảo ngược
+        //        if (distPositive < GetParallelLineDistance(line1,line2)) // Ngưỡng gần để xác định hướng
+        //        {
+        //            normal = -normal;
+        //        }
+
+        //        // Offset 0.5mm theo hướng đúng
+        //        double offsetDist = 0.5;
+        //        Vector3d offsetVec = normal.MultiplyBy(offsetDist);
+        //        Point3d newStart = line2.StartPoint + offsetVec;
+        //        Point3d newEnd = line2.EndPoint + offsetVec;
+
+        //        resultLine = new Line(newStart, newEnd);
+        //        resultLine.Layer = "1";
+        //        resultLine.ColorIndex = 3;
+        //        btr.AppendEntity(resultLine);
+        //        tr.AddNewlyCreatedDBObject(resultLine, true);
+
+        //        tr.Commit();
+        //    }
+        //    return resultLine;
+        //}
+
+
+
+        //tinh khoang cach 2 duong thang song song
         public static Line CreateOffsetLineOpposite(Database db, Line line1, Line line2)
         {
             Line resultLine = null;
 
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                // Lấy bảng block hiện tại (ModelSpace)
                 BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
                 BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
 
-                #region set lai diem start/end cua line2
-                Point3d l2_endPt = new Point3d();
-                Point3d l2_startPt=new Point3d();
-                if (line2.EndPoint.X > line2.StartPoint.X)
-                {
-                    l2_endPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
-                    l2_startPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
-                }
-                else if (line2.EndPoint.X < line2.StartPoint.X)
-                {
-                    l2_startPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
-                    l2_endPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
-                }
-                else//line2.EndPoint.X = line2.StartPoint.X
-                {
-                    if (line2.EndPoint.Y < line2.StartPoint.Y)
-                    {
-                        l2_startPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
-                        l2_endPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
-                    }
-                    else
-                    {
-                        l2_endPt = new Point3d(line2.EndPoint.X, line2.EndPoint.Y, 0);
-                        l2_startPt = new Point3d(line2.StartPoint.X, line2.StartPoint.Y, 0);
-                    }
-                }
-                #endregion
+                // Vector hướng line2
+                Vector3d dir = (line2.EndPoint - line2.StartPoint).GetNormal();
+                // Vector pháp tuyến
+                Vector3d normal = dir.RotateBy(Math.PI / 2, Vector3d.ZAxis);
 
-                // Tính vector pháp tuyến của line2
-                Vector3d dir = (l2_endPt - l2_startPt).GetNormal();
-                Vector3d normal = dir.RotateBy(Math.PI / 2, Vector3d.ZAxis); // pháp tuyến trái
-
-                // Dùng midpoint của line2 để kiểm tra vị trí line1
-                Point3d midLine2 = l2_startPt + 0.5 * (l2_endPt - l2_startPt);
-                Point3d testPt = midLine2 + normal;
-
-                // Đo khoảng cách từ testPt đến line1
-                Point3d closest = line1.GetClosestPointTo(testPt, false);
-                double distPositive = testPt.DistanceTo(closest);
-
-                // Nếu pháp tuyến đang hướng về phía line1 thì đảo ngược
-                if (distPositive < GetParallelLineDistance(line1,line2)) // Ngưỡng gần để xác định hướng
-                {
-                    normal = -normal;
-                }
-
-                // Offset 0.5mm theo hướng đúng
                 double offsetDist = 0.5;
                 Vector3d offsetVec = normal.MultiplyBy(offsetDist);
+
+                // Tạo thử 1 line offset
+                Point3d tentativeStart = line2.StartPoint + offsetVec;
+                Point3d tentativeEnd = line2.EndPoint + offsetVec;
+                Point3d midTentative = tentativeStart + 0.5 * (tentativeEnd - tentativeStart);
+
+                // Vector từ midLine2 tới midLine1
+                Point3d midLine2 = line2.StartPoint + 0.5 * (line2.EndPoint - line2.StartPoint);
+                Point3d midLine1 = line1.StartPoint + 0.5 * (line1.EndPoint - line1.StartPoint);
+
+                Vector3d vecA = midLine1 - midLine2;
+                Vector3d vecB = midTentative - midLine2;
+
+                if (vecA.DotProduct(vecB) > 0)
+                {
+                    offsetVec = -offsetVec;
+                }
+
                 Point3d newStart = line2.StartPoint + offsetVec;
                 Point3d newEnd = line2.EndPoint + offsetVec;
 
@@ -295,10 +361,10 @@ namespace LazerLabel.Kaisaki
 
                 tr.Commit();
             }
+
             return resultLine;
         }
 
-        //tinh khoang cach 2 duong thang song song
         public static double GetParallelLineDistance(Line line1, Line line2)
         {
             // Lấy midpoint của line1
@@ -433,8 +499,8 @@ namespace LazerLabel.Kaisaki
                                     tr.AddNewlyCreatedDBObject(newLine, true);
                                     newLine.ColorIndex = 3; // màu khác để dễ nhận biết
                                     newLine.Linetype = "Continuous";
-                                    //lineList.Add(newLine);
                                     addedCount++;
+
                                 }
                             }
                         }
@@ -592,7 +658,6 @@ namespace LazerLabel.Kaisaki
             model.AppendEntity(dim);
             tr.AddNewlyCreatedDBObject(dim, true);
         }
-
 
         #endregion
     }
