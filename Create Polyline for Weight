@@ -1,0 +1,697 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.Colors;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LaserWeight.LaserCalculate
+{
+    public class CreatePolyline
+    {
+        //ham noi cac line thuoc layer 12 thanh polyline
+        [CommandMethod("M0_JointRegionLine")]
+        public static void MergeLinesFromLayer12()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
+
+            // Chỉ lọc LINE trên layer "12"
+            TypedValue[] filter = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LINE"),
+                new TypedValue((int)DxfCode.LayerName, "12")
+            };
+            var selFilter = new SelectionFilter(filter);
+            var opts = new PromptSelectionOptions
+            {
+                MessageForAdding = "\n部材を囲む線を選択してください: "
+            };
+
+            var selRes = ed.GetSelection(opts, selFilter);
+            if (selRes.Status != PromptStatus.OK)
+            {
+                ed.WriteMessage("\n有効なオブジェクトは選択されません!!");
+                return;
+            }
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var linePairs = new List<(ObjectId id, Line ln)>();
+                foreach (SelectedObject so in selRes.Value)
+                {
+                    if (so == null) continue;
+                    var ent = tr.GetObject(so.ObjectId, OpenMode.ForRead) as Entity;
+                    if (ent is Line ln && ln.Layer == "12")
+                        linePairs.Add((so.ObjectId, ln));
+                }
+                if (linePairs.Count == 0) return;
+
+                // Ghép vòng
+                double tol = 0.5;
+
+                var res = BuildClosedPolylinesFromLines(linePairs, tol);
+                var polylines = res.polys;
+                var usedLineIds = res.usedLineIds;
+
+                if (polylines.Count == 0) return;
+
+                // Ghi polyline (layer 12 + vàng)
+                var btr = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
+                ObjectId layer12Id = linePairs[0].ln.LayerId;
+                foreach (Polyline pl in polylines)
+                {
+                    pl.LayerId = layer12Id;
+                    pl.Color = Color.FromColorIndex(ColorMethod.ByAci, 2); // vàng
+                    btr.AppendEntity(pl);
+                    tr.AddNewlyCreatedDBObject(pl, true);
+                }
+
+                // Xóa các LINE đã dùng
+                foreach (var lid in usedLineIds)
+                {
+                    var ent2 = tr.GetObject(lid, OpenMode.ForWrite) as Entity;
+                    ent2?.Erase();
+                }
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("M1_CreateOutlines")]
+        public void ObjectBoundary()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                CheckLayer(tr, dat, "Polyline_Temp");//check va dam bao co layer polyline
+                CreateClosedPolylineFromEntities(tr);//tao polyline bao quanh cac hinh
+                DeleteInnerPolylinesFast("Polyline_Temp");//xoa cac polyline nam ben trong
+                tr.Commit();
+            }
+        }
+
+
+
+        #region cac ham phu
+        //Ghép các LINE thành các polyline khép kín theo tolerance
+        private static List<Polyline> BuildClosedPolylinesFromLines(List<Line> lines, double tol)
+        {
+            // 1) Quy chiếu các đầu mút về “nút” theo tolerance (spatial hash)
+            var pointToNode = new Dictionary<(long, long), int>();
+            var nodeToPoint = new List<Point3d>(); // đại diện nút
+            int MapPoint(Point3d p)
+            {
+                // lượng tử hoá theo tol (vd tol=0.5 => nhân 2 để làm khoá nguyên)
+                long kx = (long)Math.Round(p.X / tol);
+                long ky = (long)Math.Round(p.Y / tol);
+                var key = (kx, ky);
+                if (!pointToNode.TryGetValue(key, out int idx))
+                {
+                    idx = nodeToPoint.Count;
+                    pointToNode[key] = idx;
+                    nodeToPoint.Add(p);
+                }
+                return idx;
+            }
+
+            // 2) Tạo danh sách cạnh (mỗi LINE là một cạnh giữa 2 nút)
+            var edges = new List<(int a, int b, Point3d pa, Point3d pb)>();
+            foreach (var ln in lines)
+            {
+                int a = MapPoint(ln.StartPoint);
+                int b = MapPoint(ln.EndPoint);
+                if (a != b) // bỏ line độ dài ~0
+                    edges.Add((a, b, ln.StartPoint, ln.EndPoint));
+            }
+
+            // 3) Adjacency + visited cho cạnh
+            var adj = new Dictionary<int, List<int>>(); // node -> indices of edges
+            for (int i = 0; i < edges.Count; i++)
+            {
+                if (!adj.ContainsKey(edges[i].a)) adj[edges[i].a] = new List<int>();
+                if (!adj.ContainsKey(edges[i].b)) adj[edges[i].b] = new List<int>();
+                adj[edges[i].a].Add(i);
+                adj[edges[i].b].Add(i);
+            }
+            var visited = new bool[edges.Count];
+
+            // 4) Duyệt tìm vòng: mỗi lần chọn một cạnh chưa thăm, đi theo “đường đi” đến khi quay về nút đầu
+            List<Polyline> result = new List<Polyline>();
+
+            for (int e0 = 0; e0 < edges.Count; e0++)
+            {
+                if (visited[e0]) continue;
+
+                // Bắt đầu từ cạnh e0, hướng từ a->b
+                var (a0, b0, pa0, pb0) = edges[e0];
+                var loop = new List<int>();
+                var pathNodes = new List<int>();
+
+                int curNode = a0;
+                int target = a0;
+                int curEdge = e0;
+                int prevEdge = -1;
+
+                // Thử đi cho đến khi không thể hoặc quay về target
+                while (true)
+                {
+                    loop.Add(curEdge);
+                    visited[curEdge] = true;
+
+                    // di chuyển sang node còn lại của cạnh hiện tại
+                    curNode = (edges[curEdge].a == curNode) ? edges[curEdge].b : edges[curEdge].a;
+                    pathNodes.Add(curNode);
+
+                    // đã đóng vòng?
+                    if (curNode == target && loop.Count >= 3)
+                    {
+                        // dựng polyline từ dãy nút
+                        var pl = new Polyline();
+                        // thêm điểm đầu (target) + các điểm đã đi
+                        var startPt = nodeToPoint[target];
+                        pl.AddVertexAt(0, new Point2d(startPt.X, startPt.Y), 0, 0, 0);
+                        for (int i = 0; i < pathNodes.Count; i++)
+                        {
+                            var p = nodeToPoint[pathNodes[i]];
+                            pl.AddVertexAt(i + 1, new Point2d(p.X, p.Y), 0, 0, 0);
+                        }
+                        pl.Closed = true;
+                        result.Add(pl);
+                        break;
+                    }
+
+                    // chọn cạnh tiếp theo kề curNode, chưa thăm
+                    int nextEdge = -1;
+                    if (adj.TryGetValue(curNode, out var list))
+                    {
+                        foreach (var ei in list)
+                        {
+                            if (!visited[ei] && ei != prevEdge)
+                            {
+                                nextEdge = ei;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (nextEdge == -1)
+                    {
+                        break;
+                    }
+
+                    prevEdge = curEdge;
+                    curEdge = nextEdge;
+                }
+            }
+
+            return result;
+        }
+
+        //Tạo layer nếu chưa có. Trả về ObjectId của layer
+        private static ObjectId EnsureLayer(Transaction tr, Database db, string name, short aciColor)
+        {
+            var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+            if (lt.Has(name))
+                return lt[name];
+
+            lt.UpgradeOpen();
+            var ltr = new LayerTableRecord
+            {
+                Name = name,
+                Color = Color.FromColorIndex(ColorMethod.ByAci, aciColor)
+            };
+            var id = lt.Add(ltr);
+            tr.AddNewlyCreatedDBObject(ltr, true);
+            return id;
+        }
+
+        private static (List<Polyline> polys, HashSet<ObjectId> usedLineIds)
+        BuildClosedPolylinesFromLines(List<(ObjectId id, Line ln)> lines, double tol)
+        {
+            // 1) Lượng tử hoá điểm theo tol -> nút
+            var pointToNode = new Dictionary<(long, long), int>();
+            var nodeToPoint = new List<Point3d>();
+            int Map(Point3d p)
+            {
+                long kx = (long)Math.Round(p.X / tol);
+                long ky = (long)Math.Round(p.Y / tol);
+                var key = (kx, ky);
+                if (!pointToNode.TryGetValue(key, out int idx))
+                {
+                    idx = nodeToPoint.Count;
+                    pointToNode[key] = idx;
+                    nodeToPoint.Add(p);
+                }
+                return idx;
+            }
+
+            // 2) Cạnh (edge) từ các line, kèm theo ObjectId nguồn
+            var edges = new List<(int a, int b, ObjectId id)>();
+            foreach (var pair in lines)
+            {
+                var ln = pair.ln;
+                int a = Map(ln.StartPoint);
+                int b = Map(ln.EndPoint);
+                if (a != b)
+                    edges.Add((a, b, pair.id));
+            }
+
+            // 3) Láng giềng node -> edge indices
+            var adj = new Dictionary<int, List<int>>();
+            for (int i = 0; i < edges.Count; i++)
+            {
+                if (!adj.ContainsKey(edges[i].a)) adj[edges[i].a] = new List<int>();
+                if (!adj.ContainsKey(edges[i].b)) adj[edges[i].b] = new List<int>();
+                adj[edges[i].a].Add(i);
+                adj[edges[i].b].Add(i);
+            }
+
+            var visitedEdge = new bool[edges.Count];
+            var usedEdge = new bool[edges.Count]; // đánh dấu các cạnh THỰC SỰ thuộc vòng
+            var result = new List<Polyline>();
+
+            for (int e0 = 0; e0 < edges.Count; e0++)
+            {
+                if (visitedEdge[e0]) continue;
+
+                int startNode = edges[e0].a;
+                int curNode = startNode;
+                int curEdge = e0;
+                int prevEdge = -1;
+
+                var loopEdges = new List<int>();
+                var pathNodes = new List<int>();
+
+                while (true)
+                {
+                    loopEdges.Add(curEdge);
+                    visitedEdge[curEdge] = true;
+
+                    // Di chuyển qua node còn lại
+                    curNode = (edges[curEdge].a == curNode) ? edges[curEdge].b : edges[curEdge].a;
+                    pathNodes.Add(curNode);
+
+                    // Đóng vòng?
+                    if (curNode == startNode && loopEdges.Count >= 3)
+                    {
+                        var pl = new Polyline();
+                        var p0 = nodeToPoint[startNode];
+                        pl.AddVertexAt(0, new Point2d(p0.X, p0.Y), 0, 0, 0);
+                        for (int i = 0; i < pathNodes.Count; i++)
+                        {
+                            var p = nodeToPoint[pathNodes[i]];
+                            pl.AddVertexAt(i + 1, new Point2d(p.X, p.Y), 0, 0, 0);
+                        }
+                        pl.Closed = true;
+                        result.Add(pl);
+
+                        // Đánh dấu các cạnh trong vòng là "đã dùng"
+                        foreach (int ei in loopEdges) usedEdge[ei] = true;
+                        break;
+                    }
+
+                    // Chọn cạnh tiếp theo từ node hiện tại, chưa thăm
+                    int nextEdge = -1;
+                    if (adj.TryGetValue(curNode, out var lst))
+                    {
+                        foreach (var ei in lst)
+                        {
+                            if (!visitedEdge[ei] && ei != prevEdge)
+                            {
+                                nextEdge = ei;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (nextEdge == -1)
+                    {
+                        break;
+                    }
+
+                    prevEdge = curEdge;
+                    curEdge = nextEdge;
+                }
+            }
+
+            // Tập ObjectId các line đã dùng (nằm trong ít nhất một vòng)
+            var usedIds = new HashSet<ObjectId>();
+            for (int i = 0; i < edges.Count; i++)
+                if (usedEdge[i]) usedIds.Add(edges[i].id);
+
+            return (result, usedIds);
+        }
+
+        //ham phu cho lenh M1____________________________________________________________________________
+        public class SegmentInfo
+        {
+            public Point3d Start { get; set; }
+            public Point3d End { get; set; }
+        }
+
+        //thu thap cac segment tu cac doi tuong duoc chon, chuan bi cho buoc tao polyline
+        public static void CreateClosedPolylineFromEntities(Transaction tr)
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            PromptSelectionResult selRes = ed.GetSelection();
+            if (selRes.Status != PromptStatus.OK)
+            {
+                ed.WriteMessage("\n選択されたオブジェクトはありません!!!");
+                return;
+            }
+
+            SelectionSet selSet = selRes.Value;
+            List<SegmentInfo> segments = new List<SegmentInfo>();
+
+            foreach (SelectedObject obj in selSet)
+            {
+                if (obj == null) continue;
+
+                Entity ent = tr.GetObject(obj.ObjectId, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+
+                if (ent is Line line && !IsWhite(line.Color) && ent.Layer!="12")
+                {
+                    segments.Add(new SegmentInfo { Start = line.StartPoint, End = line.EndPoint });
+                }
+                else if (ent is Arc arc && !IsWhite(arc.Color))
+                {
+                    //segments.Add(new SegmentInfo { Start = arc.StartPoint, End = arc.EndPoint });
+                    const int arcSegments = 3; // Bạn có thể tăng lên để vẽ cong mượt hơn
+                    double startAngle = arc.StartAngle;
+                    double endAngle = arc.EndAngle;
+
+                    // Nếu Arc ngược chiều, điều chỉnh lại
+                    if (endAngle < startAngle)
+                        endAngle += 2 * Math.PI;
+
+                    for (int i = 0; i < arcSegments; i++)
+                    {
+                        double angle1 = startAngle + (endAngle - startAngle) * i / arcSegments;
+                        double angle2 = startAngle + (endAngle - startAngle) * (i + 1) / arcSegments;
+
+                        Point3d pt1 = arc.Center + Vector3d.XAxis.RotateBy(angle1, Vector3d.ZAxis) * arc.Radius;
+                        Point3d pt2 = arc.Center + Vector3d.XAxis.RotateBy(angle2, Vector3d.ZAxis) * arc.Radius;
+
+                        segments.Add(new SegmentInfo { Start = pt1, End = pt2 });
+                    }
+                }
+                else if (ent is Polyline pl && !IsWhite(pl.Color) && ent.Layer != "12")
+                {
+                    for (int i = 0; i < pl.NumberOfVertices - 1; i++)
+                    {
+                        segments.Add(new SegmentInfo
+                        {
+                            Start = pl.GetPoint3dAt(i),
+                            End = pl.GetPoint3dAt(i + 1)
+                        });
+                    }
+                    if (pl.Closed)
+                    {
+                        segments.Add(new SegmentInfo
+                        {
+                            Start = pl.GetPoint3dAt(pl.NumberOfVertices - 1),
+                            End = pl.GetPoint3dAt(0)
+                        });
+                    }
+                }
+            }
+
+            if (segments.Count == 0)
+            {
+                ed.WriteMessage("\n有効なセグメントはありません!!!");
+                return;
+            }
+
+            // Gom các đoạn thành cụm riêng biệt
+            var clusters = ClusterSegments(segments, 5.0);
+
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
+
+            int colorIndex = 1;
+
+            foreach (var cluster in clusters)
+            {
+                Polyline result = BuildClosedPolyline(cluster);
+                if (result == null) continue;
+
+                result.Layer = "Polyline_Temp";
+                result.Color = Color.FromColorIndex(ColorMethod.ByLayer, 256);
+
+
+                btr.AppendEntity(result);
+                tr.AddNewlyCreatedDBObject(result, true);
+            }
+        }
+
+        //tao polyline tu cac segment vua thu thap
+        private static Polyline BuildClosedPolyline(List<SegmentInfo> segments)
+        {
+            if (segments.Count == 0) return null;
+
+            List<SegmentInfo> ordered = new List<SegmentInfo>();
+            SegmentInfo current = segments[0];
+            segments.RemoveAt(0);
+            ordered.Add(current);
+
+            const double epsilon = 0.1;
+
+            while (segments.Count > 0)
+            {
+                SegmentInfo next = segments.FirstOrDefault(s =>
+                    s.Start.DistanceTo(current.End) < epsilon || s.End.DistanceTo(current.End) < epsilon);
+
+                if (next == null) break;
+
+                // Nếu điểm cuối không trùng đầu, đảo chiều
+                if (next.End.DistanceTo(current.End) < epsilon)
+                {
+                    var temp = next.Start;
+                    next.Start = next.End;
+                    next.End = temp;
+                }
+
+                ordered.Add(next);
+                current = next;
+                segments.Remove(next);
+            }
+
+            Polyline result = new Polyline();
+            int idx = 0;
+
+            foreach (var seg in ordered)
+            {
+                result.AddVertexAt(idx++, new Point2d(seg.Start.X, seg.Start.Y), 0, 0, 0);
+            }
+
+            if (!IsChainClosed(ordered, 2)) // dùng sai số nhỏ hợp lý, 0.1–0.5
+            {
+                return null;
+            }
+
+            result.Closed = true;
+            return result;
+        }
+
+        //phan nhom cac segment gan nhau, co the tao thanh polyline
+        private static List<List<SegmentInfo>> ClusterSegments(List<SegmentInfo> segments, double threshold)
+        {
+            List<List<SegmentInfo>> clusters = new List<List<SegmentInfo>>();
+            HashSet<int> visited = new HashSet<int>();
+
+            for (int i = 0; i < segments.Count; i++)
+            {
+                if (visited.Contains(i)) continue;
+
+                List<SegmentInfo> cluster = new List<SegmentInfo>();
+                Queue<int> queue = new Queue<int>();
+                queue.Enqueue(i);
+                visited.Add(i);
+
+                while (queue.Count > 0)
+                {
+                    int currentIdx = queue.Dequeue();
+                    SegmentInfo current = segments[currentIdx];
+                    cluster.Add(current);
+
+                    for (int j = 0; j < segments.Count; j++)
+                    {
+                        if (visited.Contains(j)) continue;
+                        if (AreSegmentsClose(current, segments[j], threshold))
+                        {
+                            visited.Add(j);
+                            queue.Enqueue(j);
+                        }
+                    }
+                }
+
+                clusters.Add(cluster);
+            }
+
+            return clusters;
+        }
+
+        //kiem tra xem cac segment co dong hay khong
+        private static bool AreSegmentsClose(SegmentInfo a, SegmentInfo b, double threshold)
+        {
+            return a.Start.DistanceTo(b.Start) < threshold ||
+                   a.Start.DistanceTo(b.End) < threshold ||
+                   a.End.DistanceTo(b.Start) < threshold ||
+                   a.End.DistanceTo(b.End) < threshold;
+        }
+
+        //kiem tra layer xem co ton tai khong, neu khong thi tao layer moi
+        public static void CheckLayer(Transaction tr, Database db, string layName)
+        {
+            LayerTable layTb = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
+            if (!layTb.Has(layName))
+            {
+                layTb.UpgradeOpen();
+                LayerTableRecord layTbRec = new LayerTableRecord
+                {
+                    Name = layName,
+                    Color = Color.FromColorIndex(ColorMethod.ByAci, 10)
+                };
+                layTb.Add(layTbRec);
+                tr.AddNewlyCreatedDBObject(layTbRec, true);
+            }
+        }
+
+        //kiem tra xem polyline dang xet co thuc su kin hay khong
+        private static bool IsChainClosed(List<SegmentInfo> orderedSegments, double epsilon = 0.5)
+        {
+            for (int i = 0; i < orderedSegments.Count - 1; i++)
+            {
+                double dist = orderedSegments[i].End.DistanceTo(orderedSegments[i + 1].Start);
+                if (dist > epsilon)
+                {
+                    return false;
+                }
+            }
+            double closingDist = orderedSegments[0].Start.DistanceTo(orderedSegments[orderedSegments.Count - 1].End);
+            return closingDist <= epsilon;
+        }
+
+        //kiem tra mau sac cua doi tuong co phai la mau white hay khong
+        private static bool IsWhite(Color color)
+        {
+            if (color.ColorMethod == ColorMethod.ByAci && color.ColorIndex == 7)
+                return true;
+
+            if (color.ColorMethod == ColorMethod.ByColor &&
+                color.Red == 255 && color.Green == 255 && color.Blue == 255)
+                return true;
+
+            return false;
+        }
+
+        public static void DeleteInnerPolylinesFast(string layerA)
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                List<Polyline> polylines = new List<Polyline>();
+                List<ObjectId> polyIds = new List<ObjectId>();
+
+                // Lấy tất cả polyline khép kín trên layerA
+                foreach (ObjectId id in btr)
+                {
+                    if (tr.GetObject(id, OpenMode.ForRead) is Polyline pl &&
+                        pl.Layer.Equals(layerA, StringComparison.OrdinalIgnoreCase) &&
+                        pl.Closed && pl.NumberOfVertices >= 3)
+                    {
+                        polylines.Add(pl);
+                        polyIds.Add(id);
+                    }
+                }
+
+                HashSet<ObjectId> toErase = new HashSet<ObjectId>();
+
+                for (int i = 0; i < polylines.Count; i++)
+                {
+                    Polyline polyA = polylines[i];
+                    double areaA = polyA.Area;
+
+                    for (int j = 0; j < polylines.Count; j++)
+                    {
+                        if (i == j || toErase.Contains(polyIds[j])) continue;
+
+                        Polyline polyB = polylines[j];
+                        double areaB = polyB.Area;
+
+                        if (areaB < areaA && areaB<5000)//dien tich toi da de xoa la 5000
+                        {
+                            Point3d centroidB = GetCentroid(polyB);
+                            if (IsPointInPolyline(polyA, centroidB))
+                            {
+                                toErase.Add(polyIds[j]);
+                            }
+                        }
+                    }
+                }
+
+                foreach (ObjectId id in toErase)
+                {
+                    Entity ent = tr.GetObject(id, OpenMode.ForWrite) as Entity;
+                    ent.Erase();
+                }
+                tr.Commit();
+            }
+        }
+
+        //tim trong tam polyline
+        private static Point3d GetCentroid(Polyline pl)
+        {
+            double xSum = 0, ySum = 0;
+            int n = pl.NumberOfVertices;
+
+            for (int i = 0; i < n; i++)
+            {
+                xSum += pl.GetPoint2dAt(i).X;
+                ySum += pl.GetPoint2dAt(i).Y;
+            }
+            return new Point3d(xSum / n, ySum / n, 0);
+        }
+
+        //Kiem tra point co nam trong polyline khong
+        private static bool IsPointInPolyline(Polyline poly, Point3d pt)
+        {
+            int count = 0;
+            int n = poly.NumberOfVertices;
+            double x = pt.X, y = pt.Y;
+
+            for (int i = 0; i < n; i++)
+            {
+                Point2d p1 = poly.GetPoint2dAt(i);
+                Point2d p2 = poly.GetPoint2dAt((i + 1) % n);
+
+                if ((p1.Y > y) != (p2.Y > y))
+                {
+                    double xinters = (y - p1.Y) * (p2.X - p1.X) / (p2.Y - p1.Y + 1e-10) + p1.X;
+                    if (x < xinters) count++;
+                }
+            }
+            return (count % 2 == 1);
+        }
+        #endregion
+    }
+}
