@@ -1,0 +1,301 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.Colors;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LaserWeight.LaserCalculate
+{
+    public class TinhKhoiLuongTungTam
+    {
+        [CommandMethod("M2_JuuRyouTanpin")]
+        public static void CalcAreaGroupsOnTempLayer()
+        {
+            RunForLayer("Polyline_Temp", textHeight: 5.0, decimals: 0);
+        }
+
+        public static void RunForLayer(string targetLayer, double textHeight = 5.0, int decimals = 0)
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            #region bo loc
+            // 1) Hỏi người dùng chọn polyline thuoc layer chỉ định
+            var tvs = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE"),
+                new TypedValue((int)DxfCode.LayerName, targetLayer)
+            };
+            var selFilter = new SelectionFilter(tvs);
+            var opts = new PromptSelectionOptions
+            {
+                MessageForAdding = $"\n部材を選択してください:"
+            };
+
+            var selRes = ed.GetSelection(opts, selFilter);
+            if (selRes.Status != PromptStatus.OK)
+            {
+                ed.WriteMessage("\n有効なオブジェクトは選択されません!!");
+                return;
+            }
+            #endregion
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                var btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                #region tim polyline va xet quan he giua cac polyline
+                // 2) Thu thập polyline đóng từ selection
+                var items = new List<(ObjectId id, Teigha.DatabaseServices.Polyline pl, double area, Extents3d ext)>();
+                foreach (SelectedObject so in selRes.Value)
+                {
+                    if (so == null) continue;
+
+                    var pl = tr.GetObject(so.ObjectId, OpenMode.ForRead) as Teigha.DatabaseServices.Polyline;
+                    if (pl != null &&
+                        pl.Closed && pl.NumberOfVertices >= 3 &&
+                        pl.Layer.Equals(targetLayer, StringComparison.OrdinalIgnoreCase))
+                    {
+                        double area = Math.Abs(pl.Area);
+                        Extents3d ext;
+                        try { ext = pl.GeometricExtents; }
+                        catch { ext = new Extents3d(pl.StartPoint, pl.StartPoint); }
+
+                        items.Add((so.ObjectId, pl, area, ext));
+                    }
+                }
+
+                if (items.Count == 0)
+                {
+                    return;
+                }
+
+                // 3) Xet quan he polyline nay nam trong hay ngoai polyline khac
+                var parents = new Dictionary<ObjectId, ObjectId?>();
+                var children = new Dictionary<ObjectId, List<ObjectId>>();
+                foreach (var it in items) { parents[it.id] = null; children[it.id] = new List<ObjectId>(); }
+
+                for (int i = 0; i < items.Count; i++)
+                {
+                    for (int j = 0; j < items.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        var A = items[i];
+                        var B = items[j];
+
+                        // A phải lớn hơn B
+                        if (A.area <= B.area) continue;
+
+                        // Lọc nhanh bằng bbox
+                        if (!ExtContains(A.ext, B.ext)) continue;
+
+                        // Kiểm tra một điểm đại diện của B (centroid) có nằm trong A
+                        var cB = PolygonCentroid(B.pl);
+                        if (PointInPolyline(A.pl, cB))
+                        {
+                            if (parents[B.id] == null)
+                            {
+                                parents[B.id] = A.id;
+                            }
+                            else
+                            {
+                                // chọn cha gần nhất (diện tích nhỏ nhất nhưng > B)
+                                double curParentArea = items.First(t => t.id == parents[B.id]).area;
+                                if (A.area < curParentArea) parents[B.id] = A.id;
+                            }
+                        }
+                    }
+                }
+
+                foreach (var kv in parents)
+                {
+                    if (kv.Value != null) children[kv.Value.Value].Add(kv.Key);
+                }
+                #endregion
+
+                // 4) Mỗi root (không có parent) là một nhóm
+                var roots = items.Where(t => parents[t.id] == null).Select(t => t.id).ToList();
+
+                int countTexts = 0;
+                foreach (var rootId in roots)
+                {
+                    var groupIds = new List<ObjectId>();
+                    DFS(rootId, children, groupIds); // lấy toàn bộ descendants
+
+                    var group = items.Where(t => groupIds.Contains(t.id)).ToList();
+                    if (group.Count == 0) continue;
+
+                    // Diện tích nhóm
+                    var largest = group.OrderByDescending(t => t.area).First();
+                    double areaGroup = (group.Count == 1)
+                        ? largest.area
+                        : largest.area - group.Where(t => t.id != largest.id).Sum(t => t.area);
+
+                    // Centroid nhóm
+                    var cen = PolygonCentroid(largest.pl);
+
+                    #region tim chieu day, so luong tam thep
+                    Point3d minPt = largest.ext.MinPoint;
+                    Point3d maxPt= largest.ext.MaxPoint;
+                    Point3d minPt1 = new Point3d(minPt.X-20,minPt.Y-20,0);
+                    Point3d maxPt1 = new Point3d(maxPt.X+20,maxPt.Y+20,0);
+
+                    string strThick = "";
+                    string strCount = "";
+
+                    // Tạo cửa sổ chọn (SelectionWindow)
+                    var win = new Extents3d(minPt1, maxPt1);
+
+                    // Thiết lập filter để chỉ chọn DBText
+                    TypedValue[] tvs1 = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "TEXT")
+                    };
+                    SelectionFilter filter = new SelectionFilter(tvs1);
+
+                    PromptSelectionResult selRes1 = ed.SelectCrossingWindow(minPt1, maxPt1, filter);
+                    if (selRes1.Status == PromptStatus.OK)
+                    {
+                        foreach (SelectedObject so in selRes1.Value)
+                        {
+                            if (so == null) continue;
+
+                            DBText txt1 = tr.GetObject(so.ObjectId, OpenMode.ForRead) as DBText;
+                            if (txt1 == null) continue;
+
+                            string noiDung = txt1.TextString;
+                            if (strThick == "")
+                            {
+                                int idxT = noiDung.IndexOf("T/");
+                                if (idxT >= 0 && idxT + 2 < noiDung.Length)
+                                    strThick = noiDung.Substring(idxT + 2).Trim();
+                            }
+
+                            if (strCount == "")
+                            {
+                                int idxC = noiDung.IndexOf("C/");
+                                if (idxC >= 0 && idxC + 2 < noiDung.Length)
+                                    strCount = noiDung.Substring(idxC + 2).Trim();
+                            }
+                        }
+                    }
+                    #endregion
+
+                    #region 5) Ghi text
+                    double dientich = areaGroup;
+                    double ChieuDay = 0;
+                    double SoLuong = 0;
+
+                    double.TryParse(strThick, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out ChieuDay);
+                    double.TryParse(strCount, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out SoLuong);
+
+                    if (strThick != "" && strCount != "")
+                    {
+                        double KhoiLuong =Math.Round(dientich * ChieuDay * SoLuong * 7850 / 1e9,2);
+                        var txt = new DBText
+                        {
+                            Position = cen,
+                            Height = textHeight,
+                            Layer = targetLayer,
+                            Color = Color.FromColorIndex(ColorMethod.ByAci, 2), //text mau vàng
+                            //TextString = Math.Round(areaGroup, decimals).ToString()
+                            TextString = KhoiLuong.ToString()
+                        };
+                        btr.AppendEntity(txt);
+                        tr.AddNewlyCreatedDBObject(txt, true);
+                    }
+                    else
+                    {
+                        var txt = new DBText
+                        {
+                            Position = cen,
+                            Height = textHeight,
+                            Layer = targetLayer,
+                            Color = Color.FromColorIndex(ColorMethod.ByAci, 2), //text mau vàng
+                            //TextString = Math.Round(areaGroup, decimals).ToString()
+                            TextString = ""
+                        };
+                        btr.AppendEntity(txt);
+                        tr.AddNewlyCreatedDBObject(txt, true);
+                    }
+                    countTexts++;
+                    #endregion
+                }
+                tr.Commit();
+            }
+        }
+
+        #region ham phu
+        private static void DFS(ObjectId root, Dictionary<ObjectId, List<ObjectId>> children, List<ObjectId> acc)
+        {
+            acc.Add(root);
+            if (children.TryGetValue(root, out var kids))
+            {
+                foreach (var k in kids) DFS(k, children, acc);
+            }
+        }
+
+        // bbox A có bao bbox B không?
+        private static bool ExtContains(Extents3d A, Extents3d B)
+        {
+            return A.MinPoint.X <= B.MinPoint.X && A.MinPoint.Y <= B.MinPoint.Y &&
+                   A.MaxPoint.X >= B.MaxPoint.X && A.MaxPoint.Y >= B.MaxPoint.Y;
+        }
+
+        //điểm có nằm trong polyline
+        private static bool PointInPolyline(Polyline pl, Point3d pt)
+        {
+            int n = pl.NumberOfVertices;
+            if (n < 3) return false;
+
+            bool inside = false;
+            for (int i = 0, j = n - 1; i < n; j = i++)
+            {
+                var pi = pl.GetPoint2dAt(i);
+                var pj = pl.GetPoint2dAt(j);
+
+                // Kiểm tra giao với tia ngang từ pt
+                bool intersect = ((pi.Y > pt.Y) != (pj.Y > pt.Y)) &&
+                                 (pt.X < (pj.X - pi.X) * (pt.Y - pi.Y) / (pj.Y - pi.Y + 1e-12) + pi.X);
+                if (intersect) inside = !inside;
+            }
+            return inside;
+        }
+
+        // Centroid polygon
+        private static Point3d PolygonCentroid(Polyline pl)
+        {
+            int n = pl.NumberOfVertices;
+            if (n == 0) return pl.StartPoint;
+
+            double cx = 0, cy = 0, A = 0;
+
+            for (int i = 0; i < n; i++)
+            {
+                var p0 = pl.GetPoint2dAt(i);
+                var p1 = pl.GetPoint2dAt((i + 1) % n);
+                double cross = p0.X * p1.Y - p1.X * p0.Y;
+                A += cross;
+                cx += (p0.X + p1.X) * cross;
+                cy += (p0.Y + p1.Y) * cross;
+            }
+            A *= 0.5;
+            if (Math.Abs(A) < 1e-9) return pl.StartPoint; // đề phòng
+
+            cx /= (6 * A);
+            cy /= (6 * A);
+            return new Point3d(cx, cy, 0.0);
+        }
+
+        #endregion //ham phu
+    }
+}
