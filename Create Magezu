@@ -1,0 +1,1338 @@
+using DocumentFormat.OpenXml.Math;
+using DocumentFormat.OpenXml.Vml;
+using DocumentFormat.OpenXml.Wordprocessing;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+using Line = Teigha.DatabaseServices.Line;
+
+namespace LazerLabel.Mage
+{
+    public class CreateMageZu
+    {
+        #region bang tra
+        public static Dictionary<double, double> table2_3Soto;
+        public static Dictionary<double, double> table2_3Uchi;
+        public static Dictionary<double, double> table3_2Soto;
+        public static Dictionary<double, double> table3_2Uchi;
+        public static Dictionary<double, double> table4_5Soto;
+        public static Dictionary<double, double> table4_5Uchi;
+        public static Dictionary<double, double> table6Soto;
+        public static Dictionary<double, double> table6Uchi;
+        public static Dictionary<double, double> table9Soto;
+        public static Dictionary<double, double> table9Uchi;
+        #endregion
+
+        [CommandMethod("M2_CreateMageZu")]
+        public void MageZu()
+        {
+            Teigha.ApplicationServices.Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<Polyline> polyList = new List<Polyline>();
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable blTb = tr.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                #region tao bo loc
+                TypedValue[] typeValArr = new TypedValue[]
+                {
+                    new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE")
+                };
+
+                //tao bo loc
+                SelectionFilter selectFil = new SelectionFilter(typeValArr);
+                #endregion
+
+                #region lay cac polyline
+                promSeRes = doc.Editor.GetSelection(selectFil);
+
+                foreach (SelectedObject selObj in promSeRes.Value)
+                {
+                    Entity ent = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+
+                    if (ent is Polyline pl && pl.Layer == layName)
+                    {
+                        polyList.Add(pl);
+                    }
+                }
+                //sap xep polyline giam dan toa do Y
+                polyList = polyList
+                    .OrderByDescending(pl => pl.GeometricExtents.MinPoint.Y)
+                    .ThenBy(pl => pl.GeometricExtents.MinPoint.X)
+                    .ToList();
+                #endregion
+
+                #region Xử lý từng polyline
+                foreach (Polyline pl in polyList)
+                {
+                    Extents3d ext = pl.GeometricExtents;
+                    List<DBText> textList = new List<DBText>();
+                    string textAtsumi = "";
+                    double atsumi = 0;
+                    List<Line> mageLines = new List<Line>();
+
+                    // Tạo vùng mở rộng 20mm mỗi hướng
+                    double delta = 20.0;
+                    Point3d winMin = new Point3d(ext.MinPoint.X - delta, ext.MinPoint.Y - delta, 0);
+                    Point3d winMax = new Point3d(ext.MaxPoint.X + delta, ext.MaxPoint.Y + delta, 0);
+
+                    #region loc text, va them vao list
+                    TypedValue[] filterText = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "TEXT") // Lấy tất cả đối tượng text chứa loại Mage
+                    };
+
+                    SelectionFilter selFilter = new SelectionFilter(filterText);
+                    PromptSelectionResult selRes = ed.SelectWindow(winMin, winMax, selFilter);
+
+                    if (selRes.Status != PromptStatus.OK)
+                    {
+                        return;
+                    }
+
+                    foreach (SelectedObject obj in selRes.Value)
+                    {
+                        if (obj != null)
+                        {
+                            Entity ent = tr.GetObject(obj.ObjectId, OpenMode.ForRead) as Entity;
+
+                            if (ent is DBText dbText)
+                            {
+                                string textContent=dbText.TextString;
+                                if ((textContent.Contains("+") || textContent.Contains("-")) && !textContent.Contains("/"))//text chua goc
+                                {
+                                    textList.Add(dbText);
+                                }
+                                // Sau khi đã add hết, sắp xếp các text từ trên xuống dưới
+                                textList.Sort((a, b) => b.Position.Y.CompareTo(a.Position.Y));
+
+                                //tim text chua chieu day va so luong
+                                if (textContent.Contains("/"))
+                                {
+                                    textAtsumi=textContent.ToString();
+                                }
+                            }
+                        }
+                    }
+                    if (textAtsumi != null)
+                    {
+                        int slashIndex = textAtsumi.IndexOf('/');
+                        if (slashIndex > 0)
+                        {
+                            string leftPart = textAtsumi.Substring(0, slashIndex).Trim();
+                            if (double.TryParse(leftPart, out atsumi)){ }// Ép sang double
+                        }
+                    }    
+                    #endregion
+
+                    #region tim list cac line mage gan voi text nhat, tuong ung voi textList
+                    if (textList.Count == 0)
+                    { 
+                        continue;
+                    }
+                    for (int i = 0; i < textList.Count; i++)
+                    { 
+                        Line line1=new Line();
+                        line1 = FindNearestLineToText(doc, dat, tr, textList[i],winMin,winMax);
+                        mageLines.Add(line1);
+                    }
+                    //xet line mage nam ngang hay doc
+                    Line lineX = mageLines[0] as Line;
+                    string orient=GetLineOrientation(lineX);
+                    if (orient == "Vertical")//mage line gan voi phuong thang dung => sap xep lai 2 list tren
+                    {
+                        // Gộp 2 list lại thành 1 danh sách cặp
+                        var pairedList = mageLines.Zip(textList, (line, text) => new { Line = line, Text = text })
+                                                  .OrderByDescending(pair => (pair.Line.StartPoint.X + pair.Line.EndPoint.X) / 2) // hoặc StartPoint.X
+                                                  .ToList();
+
+                        // Tách lại thành 2 list mới đã sắp xếp
+                        mageLines = pairedList.Select(p => p.Line).ToList();
+                        textList = pairedList.Select(p => p.Text).ToList();
+                    }
+                    #endregion
+
+                    #region xet loai Mage
+                    string textContent1 = textList[0].TextString;
+                    string lastChar = textContent1.Substring(textContent1.Length - 1);
+
+                    if (lastChar == "L")//hinh chu L
+                    {
+                        string plusMinus = "";
+                        if (textContent1.Contains("+"))//uchi
+                        {
+                            plusMinus = "plus";
+                        }
+                        if (textContent1.Contains("-"))//soto
+                        {
+                            plusMinus = "minus";
+                        }
+
+                        char[] separators = new char[] { '-', '+' };
+                        int index = textContent1.IndexOfAny(separators);
+                        double angle=0;
+                        if (index > 0)
+                        {
+                            string beforeSign = textContent1.Substring(0, index);//tim text angle
+
+                            if (double.TryParse(beforeSign, out angle)){}//chuyen ve double
+                        }
+
+                        double cogian = Math.Abs(TimKhoangCogian(atsumi, angle, plusMinus));
+                        Line line1 = mageLines[0] as Line;//line mage
+
+                        // Tìm điểm gần nhất trên line1
+                        Point3d closestToMin = line1.GetClosestPointTo(ext.MinPoint, false);
+                        Point3d closestToMax = line1.GetClosestPointTo(ext.MaxPoint, false);
+
+                        // Tính khoảng cách
+                        double dist1 = DistancePerpendicularToLine(ext.MaxPoint, line1.StartPoint, line1.EndPoint);
+                        double dist2 = DistancePerpendicularToLine(ext.MinPoint, line1.StartPoint, line1.EndPoint);
+
+                        Point3d p0 = new Point3d(ext.MinPoint.X + 50, ext.MinPoint.Y - 400, 0);
+                        Point3d p1;
+                        Point3d p2;
+
+                        if (angle == 90)
+                        {
+                            if (plusMinus == "plus")
+                            {
+                                p1 = new Point3d(p0.X - dist2 + cogian / 2, p0.Y, 0);
+                                p2 = new Point3d(p0.X, p0.Y + dist1 - cogian / 2, 0);
+                            }
+                            else //minus
+                            {
+                                p1 = new Point3d(p0.X - dist2 - cogian / 2, p0.Y, 0);
+                                p2 = new Point3d(p0.X, p0.Y + dist1 + cogian / 2, 0);
+                            }
+                            double distP0_P1 = Math.Round(p0.DistanceTo(p1),2);
+                            double distP0_P2 = Math.Round(p0.DistanceTo(p2),2);
+
+                            //ve hinh dai khai
+                            Point3d p1A;
+                            Point3d p2A;
+                            if (dist1 - dist2>5)
+                            {
+                                p1A = new Point3d(p0.X - 200, p0.Y, 0);
+                                p2A = new Point3d(p0.X, p0.Y + 300, 0);
+                            }
+                            else if (dist2 - dist1>5)
+                            {
+                                p1A = new Point3d(p0.X - 300, p0.Y, 0);
+                                p2A = new Point3d(p0.X, p0.Y + 200, 0);
+                            }
+                            else
+                            {
+                                p1A = new Point3d(p0.X - 200, p0.Y, 0);
+                                p2A = new Point3d(p0.X, p0.Y + 200, 0);
+                            }
+
+                            Point3d p3A = new Point3d(p1A.X, p1A.Y + atsumi*2, 0);
+                            Point3d p4A = new Point3d(p2A.X - atsumi*2, p2A.Y, 0);
+                            Point3d p5A = new Point3d(p0.X - atsumi*2, p0.Y + atsumi*2, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p1A, p3A);
+                            CreateLine(dat, tr, p3A, p5A);
+                            CreateLine(dat, tr, p5A, p4A);
+                            CreateLine(dat, tr, p4A, p2A);
+
+                            //ve dim
+                            CreateDim(dat, tr, p0, p1A, distP0_P1.ToString(),100);
+                            CreateDim(dat, tr, p0, p2A, distP0_P2.ToString(),-100);
+
+                            //veleader
+                            string linetype = line1.Linetype;
+                            if (linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase)|| linetype.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))//continous =>Oshisenne 
+                            {
+                                Point3d p6A = new Point3d(p0.X - 140, p0.Y + 140, 0);
+                                Point3d p7A = new Point3d(p6A.X - 220, p6A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p5A, p6A, p7A);
+
+                                Point3d textbasePt = new Point3d(p7A.X + 3, p7A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "おしせん");
+                            }
+                            else//net dut =>Omote
+                            {
+                                Point3d p6A = new Point3d(p0.X, p0.Y + 25, 0);
+                                Point3d p7A = new Point3d(p0.X + 60, p0.Y - 90, 0);
+                                Point3d p8A = new Point3d(p7A.X + 180, p7A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p6A, p7A, p8A);
+
+                                Point3d textbasePt = new Point3d(p7A.X + 3, p7A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "オモテ");
+                            }
+                        }
+                        else//goc tu >90 do
+                        {
+                            if (plusMinus == "plus")
+                            {
+                                dist1 -= cogian / 2;
+                                dist2 -= cogian / 2;
+                            }
+                            else //minus
+                            {
+                                dist1 += cogian / 2;
+                                dist2 += cogian / 2;
+                            }
+
+                            //ve hinh dai khai, voi goc là 108.435 độ
+                            Point3d p1A = new Point3d(p0.X + 200, p0.Y, 0);
+                            Point3d p2A = new Point3d(p0.X - 20, p0.Y + 60, 0);
+                            Point3d p3A = new Point3d(p2A.X + 2*atsumi/Math.Sin((180-108.435)*Math.PI/180), p2A.Y, 0);
+                            Point3d p4A = new Point3d(p0.X + 2*atsumi/Math.Tan((108.435/2) * Math.PI / 180), p0.Y + 2*atsumi, 0);
+                            Point3d p5A = new Point3d(p1A.X, p1A.Y + 2*atsumi, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p2A, p3A);
+                            CreateLine(dat, tr, p3A, p4A);
+                            CreateLine(dat, tr, p4A, p5A);
+                            CreateLine(dat, tr, p5A, p1A);
+
+                            //ve dim
+                            if (dist2 - dist1 > 5)
+                            {
+                                double h1 = Math.Round(dist1 * Math.Sin((180 - angle) * Math.PI / 180), 2);// gia tri dim chieu cao
+                                double w1 = Math.Round(dist1 * Math.Cos((180 - angle) * Math.PI / 180), 2);// gia tri dim be rong
+                                CreateDimensionY(dat, tr, p2A, p0, -100, h1.ToString());
+                                CreateDimensionX(dat, tr, p2A, p0, -100, w1.ToString());
+                                CreateDimensionX(dat, tr, p0, p1A, -100, Math.Round(dist2, 2).ToString());
+                            }
+                            else if (dist1 - dist2 > 5)
+                            {
+                                double h1 = Math.Round(dist2 * Math.Sin((180 - angle) * Math.PI / 180), 2);// gia tri dim chieu cao
+                                double w1 = Math.Round(dist2 * Math.Cos((180 - angle) * Math.PI / 180), 2);// gia tri dim be rong
+                                CreateDimensionY(dat, tr, p2A, p0, -100, h1.ToString());
+                                CreateDimensionX(dat, tr, p2A, p0, -100, w1.ToString());
+                                CreateDimensionX(dat, tr, p0, p1A, -100, Math.Round(dist1, 2).ToString());
+                            }
+
+                            //veleader
+                            string linetype = line1.Linetype;
+                            if (linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase) || linetype.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))//continous =>Oshisenne 
+                            {
+                                Point3d p6A = new Point3d(p4A.X + 60, p0.Y + 95, 0);
+                                Point3d p7A = new Point3d(p6A.X + 220, p6A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p4A, p6A, p7A);
+
+                                Point3d textbasePt = new Point3d(p6A.X + 3, p6A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "おしせん");
+                            }
+                            else//net dut =>Omote
+                            {
+                                Point3d p6A = new Point3d(p0.X - 70, p0.Y - 180, 0);
+                                Point3d p7A = new Point3d(p6A.X - 180, p6A.Y, 0);
+                                //Point3d p8A = new Point3d(p7A.X + 100, p7A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p0, p6A, p7A);
+
+                                Point3d textbasePt = new Point3d(p7A.X + 3, p7A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "オモテ");
+                            }
+                        }
+                    }
+                    else if (lastChar == "U")//hinh chu U
+                    {
+                        if (textList.Count < 0)
+                        {
+                            continue;
+                        }
+                        string textContent2 = textList[1].TextString;
+                        char[] separators = new char[] { '-', '+' };
+
+                        #region text1
+                        int index1 = textContent1.IndexOfAny(separators);
+                        double angle1 = 0;
+                        if (index1 > 0)
+                        {
+                            string beforeSign1 = textContent1.Substring(0, index1);//tim text angle
+
+                            if (double.TryParse(beforeSign1, out angle1)) { }//chuyen ve double
+                        }
+
+                        string plusMinus1 = "";
+                        if (textContent1.Contains("+"))//uchi
+                        {
+                            plusMinus1 = "plus";
+                        }
+                        if (textContent1.Contains("-"))//soto
+                        {
+                            plusMinus1 = "minus";
+                        }
+                        double cogian1 = Math.Abs(TimKhoangCogian(atsumi, angle1, plusMinus1));
+                        Line line1 = mageLines[0] as Line;//line mage
+                        #endregion //text1
+
+                        #region text2
+                        int index2 = textContent2.IndexOfAny(separators);
+                        double angle2 = 0;
+                        if (index2 > 0)
+                        {
+                            string beforeSign2 = textContent2.Substring(0, index2);//tim text angle
+
+                            if (double.TryParse(beforeSign2, out angle2)) { }//chuyen ve double
+                        }
+
+                        string plusMinus2 = "";
+                        if (textContent2.Contains("+"))//uchi
+                        {
+                            plusMinus2 = "plus";
+                        }
+                        if (textContent2.Contains("-"))//soto
+                        {
+                            plusMinus2 = "minus";
+                        }
+                        double cogian2 = Math.Abs(TimKhoangCogian(atsumi, angle2, plusMinus2));
+                        Line line2 = mageLines[1] as Line;//line mage
+                        #endregion //text2
+
+                        // Tìm điểm gần nhất trên line1 so voi MaxPt
+                        Point3d closestToMax = line1.GetClosestPointTo(ext.MaxPoint, false);
+
+                        // Tìm điểm gần nhất trên line2 so voi MinPt
+                        Point3d closestToMin = line2.GetClosestPointTo(ext.MinPoint, false);
+
+                        #region khoang cach
+                        // Tính khoảng cách
+                        double dist1 = DistancePerpendicularToLine(ext.MaxPoint, line1.StartPoint, line1.EndPoint);
+                        double dist2 = DistancePerpendicularToLine(ext.MinPoint, line2.StartPoint, line2.EndPoint);
+                        Point3d line1MidPt = new Point3d((line1.StartPoint.X+line1.EndPoint.X)/2,(line1.StartPoint.Y + line1.EndPoint.Y)/2,0);
+                        double dist0 = DistancePerpendicularToLine(line1MidPt, line2.StartPoint, line2.EndPoint);//khoang cach giua 2 line
+                        double deltaX = dist0;// chieu dai phuong X p0-p1
+                        double deltaY1 = dist1;//chieu dai canh 1 p1-p3
+                        double deltaY2 = dist2;//chieu dai canh 2 p0-p2
+
+                        Point3d p0 = new Point3d(ext.MinPoint.X + 50, ext.MinPoint.Y - 400, 0);
+
+                        if (plusMinus1 == "plus")
+                        {
+                            deltaX -= cogian1 / 2;
+                            deltaY1 -= cogian1 / 2;
+                        }
+                        else //minus
+                        {
+                            deltaX += cogian1 / 2;
+                            deltaY1 += cogian1 / 2;
+                        }
+                        if (plusMinus2 == "plus")
+                        {
+                            deltaX -= cogian2 / 2;
+                            deltaY2 -= cogian2 / 2;
+                        }
+                        else //minus
+                        {
+                            deltaX += cogian2 / 2;
+                            deltaY2 += cogian2 / 2;
+                        }
+                        #endregion //khoang cach
+
+                        if (angle1 == 90 && angle2 == 90)
+                        {
+                            //ve hinh dai khai
+                            Point3d p1A = new Point3d(p0.X + 250, p0.Y, 0);
+                            Point3d p2A;
+                            Point3d p3A;
+                            if (dist1 - dist2 >5)//ben phai thap hon ben trai
+                            {
+                                p2A = new Point3d(p0.X, p0.Y + 75, 0);
+                                p3A = new Point3d(p1A.X, p1A.Y + 150, 0);
+                            }
+                            else if (dist2 - dist1 >5)//ben phai cao hon ben trai
+                            {
+                                p2A = new Point3d(p0.X, p0.Y + 150, 0);
+                                p3A = new Point3d(p1A.X, p1A.Y + 75, 0);
+                            }
+                            else
+                            {
+                                p2A = new Point3d(p0.X, p0.Y + 120, 0);
+                                p3A = new Point3d(p1A.X, p1A.Y + 120, 0);
+                            }
+                            
+                            Point3d p4A = new Point3d(p2A.X + 2*atsumi, p2A.Y, 0);
+                            Point3d p5A = new Point3d(p1A.X - 2 * atsumi, p3A.Y, 0);
+                            Point3d p6A = new Point3d(p4A.X, p0.Y + 2*atsumi, 0);
+                            Point3d p7A = new Point3d(p5A.X, p1A.Y + 2 * atsumi, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p1A, p3A);
+                            CreateLine(dat, tr, p2A, p4A);
+                            CreateLine(dat, tr, p3A, p5A);
+                            CreateLine(dat, tr, p4A, p6A);
+                            CreateLine(dat, tr, p6A, p7A);
+                            CreateLine(dat, tr, p7A, p5A);
+
+                            //ve dim
+                            CreateDim(dat, tr, p0, p1A, Math.Round(deltaX,2).ToString(), -100);
+                            CreateDim(dat, tr, p1A, p3A, Math.Round(deltaY1, 2).ToString(), -100);
+                            CreateDim(dat, tr, p0, p2A, Math.Round(deltaY2, 2).ToString(), 100);
+
+                            //veleader
+                            string linetype = line1.Linetype;
+                            if (linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase) || linetype.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))//continous =>Oshisenne 
+                            {
+                                Point3d p8A = new Point3d(p6A.X + 125, p6A.Y + 180, 0);
+                                Point3d p9A = new Point3d(p8A.X + 230, p8A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p6A, p8A, p9A);
+                                CreateLeaderNoText(dat, tr, p7A, p8A, p9A);
+
+                                Point3d textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "おしせん");
+                            }
+                            else//net dut =>Omote
+                            {
+                                Point3d p10A = new Point3d(p1A.X - 30, p1A.Y, 0);
+                                Point3d p8A = new Point3d(p1A.X + 80, p1A.Y - 125, 0);
+                                Point3d p9A = new Point3d(p8A.X + 180, p8A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p10A, p8A, p9A);
+
+                                Point3d textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "オモテ");
+                            }
+                        }
+                        else if (angle1 == 90 && angle2 > 90)
+                        {
+                            //ve hinh dai khai voi goc bang 108.435 độ
+                            Point3d p1A = new Point3d(p0.X + 150, p0.Y, 0);
+                            Point3d p2A;
+                            Point3d p3A;
+                            if (dist1 - dist2>5)//ben phai thap hon ben trai
+                            {
+                                p2A = new Point3d(p0.X - 50, p0.Y + 150, 0);
+                                p3A = new Point3d(p1A.X, p1A.Y + 60, 0);
+                            }
+                            else if (dist2 - dist1>5)//ben phai cao hon ben trai
+                            {
+                                p2A = new Point3d(p0.X - 20, p0.Y + 60, 0);
+                                p3A = new Point3d(p1A.X, p1A.Y + 150, 0);
+                            }
+                            else
+                            {
+                                p2A = new Point3d(p0.X - 20, p0.Y + 60, 0);
+                                p3A = new Point3d(p1A.X, p1A.Y + 60, 0);
+                            }
+                            Point3d p4A = new Point3d(p2A.X + 2 * atsumi / Math.Sin((180 - 108.435) * Math.PI / 180), p2A.Y, 0);
+                            Point3d p5A = new Point3d(p0.X + 2 * atsumi / Math.Tan((108.435 / 2) * Math.PI / 180), p0.Y + 2 * atsumi, 0);
+                            Point3d p6A = new Point3d(p1A.X - 2 * atsumi, p1A.Y + 2 * atsumi, 0);
+                            Point3d p7A = new Point3d(p3A.X - 2 * atsumi, p3A.Y, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p1A, p3A);
+                            CreateLine(dat, tr, p2A, p4A);
+                            CreateLine(dat, tr, p4A, p5A);
+                            CreateLine(dat, tr, p5A, p6A);
+                            CreateLine(dat, tr, p6A, p7A);
+                            CreateLine(dat, tr, p7A, p3A);
+
+                            //ve dim
+                            double h1 = Math.Round(deltaY2 * Math.Sin((180 - angle2) * Math.PI / 180), 2);// gia tri dim chieu cao
+                            double w1 = Math.Round(deltaY2 * Math.Cos((180 - angle2) * Math.PI / 180), 2);// gia tri dim be rong
+                            CreateDimensionX(dat, tr, p2A, p0, -100, Math.Round(w1, 2).ToString());
+                            CreateDimensionX(dat, tr, p0, p1A, -100, Math.Round(deltaX, 2).ToString());
+                            CreateDimensionY(dat, tr, p1A, p3A, 100, Math.Round(deltaY1, 2).ToString());
+                            CreateDimensionY(dat, tr, p0, p2A, -100, Math.Round(h1, 2).ToString());
+
+                            //veleader
+                            string linetype = line1.Linetype;
+                            if (linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase) || linetype.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))//continous =>Oshisenne 
+                            {
+                                Point3d p8A = new Point3d(p0.X + 65, p0.Y + 150, 0);
+                                Point3d p9A;
+                                Point3d textbasePt;
+                                if (dist1 > dist2)//ben phai cao hon
+                                {
+                                    p9A = new Point3d(p8A.X - 230, p8A.Y, 0);
+                                    textbasePt = new Point3d(p9A.X + 3, p8A.Y + 3, 0);
+                                }
+                                else//ben trai cao hon
+                                {
+                                    p9A = new Point3d(p8A.X + 230, p8A.Y, 0);
+                                    textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+                                }
+                                
+                                CreateLeaderNoText(dat, tr, p6A, p8A, p9A);
+                                CreateLeaderNoText(dat, tr, p5A, p8A, p9A);
+                                
+                                CreateMText(dat, tr, textbasePt, "おしせん");
+                            }
+                            else//net dut =>Omote
+                            {
+                                Point3d p10A = new Point3d(p1A.X - 30, p1A.Y, 0);
+                                Point3d p8A = new Point3d(p1A.X + 80, p1A.Y - 125, 0);
+                                Point3d p9A = new Point3d(p8A.X + 180, p8A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p10A, p8A, p9A);
+
+                                Point3d textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "オモテ");
+                            }
+                        }
+                        else if (angle1 > 90 && angle2 == 90)
+                        {
+                            //ve hinh dai khai voi goc bang 108.435 độ
+                            Point3d p1A = new Point3d(p0.X + 150, p0.Y, 0);
+                            Point3d p2A;
+                            Point3d p3A;
+                            if (dist1 - dist2>5)//ben trai cao hon
+                            {
+                                p2A = new Point3d(p0.X, p0.Y + 150, 0);
+                                p3A = new Point3d(p1A.X + 20, p1A.Y + 60, 0);
+                            }
+                            else if (dist2 - dist1>5)//ben phai cao hon
+                            {
+                                p2A = new Point3d(p0.X, p0.Y + 60, 0);
+                                p3A = new Point3d(p1A.X + 50, p1A.Y + 150, 0);
+                            }
+                            else
+                            {
+                                p2A = new Point3d(p0.X, p0.Y + 60, 0);
+                                p3A = new Point3d(p1A.X + 20, p1A.Y + 60, 0);
+                            }
+                            Point3d p4A = new Point3d(p2A.X + 2 * atsumi, p2A.Y, 0);
+                            Point3d p5A = new Point3d(p0.X + 2 * atsumi, p0.Y + 2*atsumi, 0);
+                            Point3d p6A = new Point3d(p1A.X - 2 * atsumi / Math.Tan((108.435 / 2) * Math.PI / 180), p0.Y + 2 * atsumi, 0);
+                            Point3d p7A = new Point3d(p3A.X - 2 * atsumi / Math.Sin((180 - 108.435) * Math.PI / 180), p3A.Y, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p1A, p3A);
+                            CreateLine(dat, tr, p2A, p4A);
+                            CreateLine(dat, tr, p4A, p5A);
+                            CreateLine(dat, tr, p5A, p6A);
+                            CreateLine(dat, tr, p6A, p7A);
+                            CreateLine(dat, tr, p7A, p3A);
+
+                            //ve dim
+                            double h1 = Math.Round(deltaY1 * Math.Sin((180 - angle1) * Math.PI / 180), 2);// gia tri dim chieu cao
+                            double w1 = Math.Round(deltaY1 * Math.Cos((180 - angle1) * Math.PI / 180), 2);// gia tri dim be rong
+                            CreateDimensionX(dat, tr, p0, p1A, -100, Math.Round(deltaX, 2).ToString());
+                            CreateDimensionX(dat, tr, p1A, p3A, -100, Math.Round(w1, 2).ToString());
+                            CreateDimensionY(dat, tr, p1A, p3A, 150, Math.Round(h1, 2).ToString());
+                            CreateDimensionY(dat, tr, p0, p2A, -100, Math.Round(deltaY2, 2).ToString());
+
+                            //veleader
+                            string linetype = line1.Linetype;
+                            if (linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase) || linetype.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))//continous =>Oshisenne 
+                            {
+                                Point3d p8A = new Point3d(p0.X + 75, p0.Y + 150, 0);
+                                Point3d p9A;
+                                Point3d textbasePt;
+                                if (dist1 > dist2)//ben phai cao hon
+                                {
+                                    p9A = new Point3d(p8A.X - 230, p8A.Y, 0);
+                                    textbasePt = new Point3d(p9A.X + 3, p8A.Y + 3, 0);
+                                }
+                                else//ben trai cao hon
+                                {
+                                    p9A = new Point3d(p8A.X + 230, p8A.Y, 0);
+                                    textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+                                }
+
+                                CreateLeaderNoText(dat, tr, p6A, p8A, p9A);
+                                CreateLeaderNoText(dat, tr, p5A, p8A, p9A);
+
+                                CreateMText(dat, tr, textbasePt, "おしせん");
+                            }
+                            else//net dut =>Omote
+                            {
+                                Point3d p10A = new Point3d(p0.X + 30, p0.Y, 0);
+                                Point3d p8A = new Point3d(p0.X - 65, p0.Y - 125, 0);
+                                Point3d p9A = new Point3d(p8A.X - 180, p8A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p10A, p8A, p9A);
+
+                                Point3d textbasePt = new Point3d(p9A.X + 3, p9A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "オモテ");
+                            }
+                        }
+                        else
+                        {
+                            //ve hinh dai khai voi goc bang 108.435 độ
+                            Point3d p1A = new Point3d(p0.X + 300, p0.Y, 0);
+                            Point3d p2A;
+                            Point3d p3A;
+                            if (dist1 - dist2 > 5)//ben phai cao hon
+                            {
+                                p2A = new Point3d(p0.X - 20, p0.Y + 60, 0);
+                                p3A = new Point3d(p1A.X + 60, p0.Y + 150, 0);
+                            }
+                            else if (dist2 - dist1>5)
+                            {
+                                p2A = new Point3d(p0.X - 60, p0.Y + 150, 0);
+                                p3A = new Point3d(p1A.X + 20, p0.Y + 60, 0);
+                            }
+                            else
+                            {
+                                p2A = new Point3d(p0.X - 20, p0.Y + 60, 0);
+                                p3A = new Point3d(p1A.X + 20, p0.Y + 60, 0);
+                            }
+                            
+                            Point3d p4A = new Point3d(p2A.X + 2 * atsumi / Math.Sin((180 - 108.435) * Math.PI / 180), p2A.Y, 0);
+                            Point3d p6A = new Point3d(p0.X + 2 * atsumi / Math.Tan((108.435 / 2) * Math.PI / 180), p0.Y + 2 * atsumi, 0);
+                            Point3d p5A = new Point3d(p3A.X - 2 * atsumi / Math.Sin((180 - 108.435) * Math.PI / 180), p3A.Y, 0);
+                            Point3d p7A = new Point3d(p1A.X - 2 * atsumi / Math.Tan((108.435 / 2) * Math.PI / 180), p1A.Y + 2 * atsumi, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p1A, p3A);
+                            CreateLine(dat, tr, p2A, p4A);
+                            CreateLine(dat, tr, p4A, p6A);
+                            CreateLine(dat, tr, p6A, p7A);
+                            CreateLine(dat, tr, p7A, p5A);
+                            CreateLine(dat, tr, p5A, p3A);
+
+                            //ve dim
+                            double h1 = Math.Round(deltaY1 * Math.Sin((180 - angle1) * Math.PI / 180), 2);// gia tri dim chieu cao, goc 1
+                            double w1 = Math.Round(deltaY1 * Math.Cos((180 - angle1) * Math.PI / 180), 2);// gia tri dim be rong, goc 1
+                            double h2 = Math.Round(deltaY2 * Math.Sin((180 - angle2) * Math.PI / 180), 2);// gia tri dim chieu cao, goc 2
+                            double w2 = Math.Round(deltaY2 * Math.Cos((180 - angle2) * Math.PI / 180), 2);// gia tri dim be rong, goc 2
+                            CreateDimensionX(dat, tr, p2A, p0, -100, Math.Round(w2, 2).ToString());
+                            CreateDimensionX(dat, tr, p0, p1A, -100, Math.Round(deltaX, 2).ToString());
+                            CreateDimensionX(dat, tr, p1A, p3A, -100, Math.Round(w1, 2).ToString());
+                            CreateDimensionY(dat, tr, p1A, p3A, 120, Math.Round(h1, 2).ToString());
+                            CreateDimensionY(dat, tr, p0, p2A, -100, Math.Round(h2, 2).ToString());
+
+                            //veleader
+                            string linetype = line1.Linetype;
+                            if (linetype.Equals("Continuous", StringComparison.OrdinalIgnoreCase) || linetype.Equals("ByLayer", StringComparison.OrdinalIgnoreCase))//continous =>Oshisenne 
+                            {
+                                Point3d p8A = new Point3d(p0.X + 200, p0.Y + 220, 0);
+                                Point3d p9A = new Point3d(p8A.X + 230, p8A.Y, 0);
+                                Point3d textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+
+                                CreateLeaderNoText(dat, tr, p6A, p8A, p9A);
+                                CreateLeaderNoText(dat, tr, p7A, p8A, p9A);
+
+                                CreateMText(dat, tr, textbasePt, "おしせん");
+                            }
+                            else//net dut =>Omote
+                            {
+                                Point3d p10A = new Point3d(p1A.X - 90, p1A.Y, 0);
+                                Point3d p8A = new Point3d(p1A.X + 20, p1A.Y - 200, 0);
+                                Point3d p9A = new Point3d(p8A.X + 220, p8A.Y, 0);
+                                CreateLeaderNoText(dat, tr, p10A, p8A, p9A);
+
+                                Point3d textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+                                CreateMText(dat, tr, textbasePt, "オモテ");
+                            }
+                        }
+                    }
+                    else if (lastChar == "Z")//hinh chu Z
+                    {
+                        if (textList.Count < 0)
+                        {
+                            continue;
+                        }
+                        string textContent2 = textList[1].TextString;
+                        char[] separators = new char[] { '-', '+' };
+
+                        #region text1
+                        int index1 = textContent1.IndexOfAny(separators);
+                        double angle1 = 0;
+                        if (index1 > 0)
+                        {
+                            string beforeSign1 = textContent1.Substring(0, index1);//tim text angle
+
+                            if (double.TryParse(beforeSign1, out angle1)) { }//chuyen ve double
+                        }
+
+                        string plusMinus1 = "";
+                        if (textContent1.Contains("+"))//uchi
+                        {
+                            plusMinus1 = "plus";
+                        }
+                        if (textContent1.Contains("-"))//soto
+                        {
+                            plusMinus1 = "minus";
+                        }
+                        double cogian1 = Math.Abs(TimKhoangCogian(atsumi, angle1, plusMinus1));
+                        Line line1 = mageLines[0] as Line;//line mage
+                        #endregion //text1
+
+                        #region text2
+                        int index2 = textContent2.IndexOfAny(separators);
+                        double angle2 = 0;
+                        if (index2 > 0)
+                        {
+                            string beforeSign2 = textContent2.Substring(0, index2);//tim text angle
+
+                            if (double.TryParse(beforeSign2, out angle2)) { }//chuyen ve double
+                        }
+
+                        string plusMinus2 = "";
+                        if (textContent2.Contains("+"))//uchi
+                        {
+                            plusMinus2 = "plus";
+                        }
+                        if (textContent2.Contains("-"))//soto
+                        {
+                            plusMinus2 = "minus";
+                        }
+                        double cogian2 = Math.Abs(TimKhoangCogian(atsumi, angle2, plusMinus2));
+                        Line line2 = mageLines[1] as Line;//line mage
+                        #endregion //text2
+
+                        // Tìm điểm gần nhất trên line1 so voi MaxPt
+                        Point3d closestToMax = line1.GetClosestPointTo(ext.MaxPoint, false);
+
+                        // Tìm điểm gần nhất trên line2 so voi MinPt
+                        Point3d closestToMin = line2.GetClosestPointTo(ext.MinPoint, false);
+
+                        #region khoang cach
+                        // Tính khoảng cách
+                        double dist1 = DistancePerpendicularToLine(ext.MaxPoint, line1.StartPoint, line1.EndPoint);
+                        double dist2 = DistancePerpendicularToLine(ext.MinPoint, line2.StartPoint, line2.EndPoint);
+                        Point3d line1MidPt = new Point3d((line1.StartPoint.X + line1.EndPoint.X) / 2, (line1.StartPoint.Y + line1.EndPoint.Y) / 2, 0);
+                        double dist0 = DistancePerpendicularToLine(line1MidPt, line2.StartPoint, line2.EndPoint);//khoang cach giua 2 line
+                        double deltaX = dist0;// chieu dai phuong X
+                        double deltaY1 = dist1;//chieu dai canh 1
+                        double deltaY2 = dist2;//chieu dai canh 2
+
+                        Point3d p0 = new Point3d(ext.MinPoint.X + 50, ext.MinPoint.Y - 400, 0);
+
+                        if (plusMinus1 == "plus")
+                        {
+                            deltaX -= cogian1 / 2;
+                            deltaY1 -= cogian1 / 2;
+                        }
+                        else //minus
+                        {
+                            deltaX += cogian1 / 2;
+                            deltaY1 += cogian1 / 2;
+                        }
+                        if (plusMinus2 == "plus")
+                        {
+                            deltaX -= cogian2 / 2;
+                            deltaY2 -= cogian2 / 2;
+                        }
+                        else //minus
+                        {
+                            deltaX += cogian2 / 2;
+                            deltaY2 += cogian2 / 2;
+                        }
+                        #endregion //khoang cach
+
+                        if (angle1 == 90 && angle2 == 90 && plusMinus1=="plus" && plusMinus2=="minus")//hinh so 5
+                        {
+                            //ve hinh dai khai
+                            Point3d p1A = new Point3d(p0.X, p0.Y + 100, 0);
+                            Point3d p2A;
+                            Point3d p3A;
+                            if (dist2 - dist1 > 5)//ben phai ngan hon ben trai
+                            {
+                                p2A = new Point3d(p0.X - 240, p0.Y, 0);
+                                p3A = new Point3d(p1A.X + 140, p1A.Y, 0);
+                            }
+                            else//ben phai dai hon ben trai
+                            {
+                                p2A = new Point3d(p0.X - 140, p0.Y, 0);
+                                p3A = new Point3d(p1A.X + 240, p1A.Y, 0);
+                            }
+
+                            Point3d p4A = new Point3d(p2A.X, p2A.Y + 2*atsumi, 0);
+                            Point3d p5A = new Point3d(p0.X - 2*atsumi, p0.Y + 2*atsumi, 0);
+                            Point3d p6A = new Point3d(p5A.X, p1A.Y + 2 * atsumi, 0);
+                            Point3d p7A = new Point3d(p3A.X, p6A.Y, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p1A, p3A);
+                            CreateLine(dat, tr, p2A, p4A);
+                            CreateLine(dat, tr, p4A, p5A);
+                            CreateLine(dat, tr, p5A, p6A);
+                            CreateLine(dat, tr, p6A, p7A);
+                            CreateLine(dat, tr, p7A, p3A);
+
+                            //ve dim
+                            CreateDimensionX(dat, tr, p2A, p0, -100, Math.Round(deltaY2, 2).ToString());
+                            CreateDimensionX(dat, tr, p0, p3A, -100, Math.Round(deltaY1, 2).ToString());
+                            if (dist1 < dist2)//ben phai ngan hon ben trai
+                            {
+                                CreateDimensionY(dat, tr, p0, p3A, 100 + 140, Math.Round(deltaX, 2).ToString());
+                            }
+                            else//ben phai dai hon ben trai
+                            {
+                                CreateDimensionY(dat, tr, p0, p3A, 100 + 240, Math.Round(deltaX, 2).ToString());
+                            }
+
+                            //veleader
+                            Point3d p8A = new Point3d(p3A.X + 80, p0.Y - 120, 0);
+                            Point3d p9A = new Point3d(p8A.X + 230, p8A.Y, 0);
+                            CreateLeaderNoText(dat, tr, p1A, p8A, p9A);
+
+                            Point3d textbasePt = new Point3d(p8A.X + 3, p8A.Y + 3, 0);
+                            CreateMText(dat, tr, textbasePt, "おしせん");
+                        }
+                        if (angle1 == 90 && angle2 == 90 && plusMinus1 == "minus" && plusMinus2 == "plus")//hinh so 2
+                        {
+                            //ve hinh dai khai
+                            Point3d p1A = new Point3d(p0.X, p0.Y - 100, 0);
+                            Point3d p2A;
+                            Point3d p3A;
+                            if (dist2 - dist1 > 5)//ben phai ngan hon ben trai
+                            {
+                                p2A = new Point3d(p0.X - 240, p0.Y, 0);
+                                p3A = new Point3d(p1A.X + 140, p1A.Y, 0);
+                            }
+                            else//ben phai dai hon ben trai
+                            {
+                                p2A = new Point3d(p0.X - 140, p0.Y, 0);
+                                p3A = new Point3d(p1A.X + 240, p1A.Y, 0);
+                            }
+
+                            Point3d p4A = new Point3d(p2A.X, p2A.Y + 2 * atsumi, 0);
+                            Point3d p5A = new Point3d(p0.X + 2 * atsumi, p0.Y + 2 * atsumi, 0);
+                            Point3d p6A = new Point3d(p1A.X + 2*atsumi, p1A.Y + 2 * atsumi, 0);
+                            Point3d p7A = new Point3d(p3A.X, p6A.Y, 0);
+
+                            //ve duong thang
+                            CreateLine(dat, tr, p0, p1A);
+                            CreateLine(dat, tr, p0, p2A);
+                            CreateLine(dat, tr, p1A, p3A);
+                            CreateLine(dat, tr, p2A, p4A);
+                            CreateLine(dat, tr, p4A, p5A);
+                            CreateLine(dat, tr, p5A, p6A);
+                            CreateLine(dat, tr, p6A, p7A);
+                            CreateLine(dat, tr, p7A, p3A);
+
+                            //ve dim
+                            CreateDimensionX(dat, tr, p2A, p1A, -100, Math.Round(deltaY2, 2).ToString());
+                            CreateDimensionX(dat, tr, p1A, p3A, -100, Math.Round(deltaY1, 2).ToString());
+                            if (dist1 < dist2)//ben phai ngan hon ben trai
+                            {
+                                CreateDimensionY(dat, tr, p2A, p1A, -100, Math.Round(deltaX, 2).ToString());
+                            }
+                            else//ben phai dai hon ben trai
+                            {
+                                CreateDimensionY(dat, tr, p2A, p1A, -100, Math.Round(deltaX, 2).ToString());
+                            }
+
+                            //veleader
+                            Point3d p8A = new Point3d(p2A.X - 60, p0.Y - 200, 0);
+                            Point3d p9A = new Point3d(p8A.X - 230, p8A.Y, 0);
+                            CreateLeaderNoText(dat, tr, p0, p8A, p9A);
+
+                            Point3d textbasePt = new Point3d(p9A.X + 3, p9A.Y + 3, 0);
+                            CreateMText(dat, tr, textbasePt, "おしせん");
+                        }
+                    }
+                    else
+                    { 
+                    //khong lam gi
+                    }
+
+                    #endregion
+                }
+                #endregion
+
+                tr.Commit();
+            }
+        }
+
+        #region ham dung chung
+        //tim line gan text nhat
+        public static Line FindNearestLineToText(Teigha.ApplicationServices.Document doc, Database db, Transaction tr,DBText text,Point3d minPt,Point3d maxPt)
+        {
+            Editor ed = doc.Editor;
+
+            // Khởi tạo biến lưu line kết quả và khoảng cách nhỏ nhất
+            Line closestLine = null;
+            double minDistance = double.MaxValue;
+
+            // Bộ lọc: chỉ lấy đối tượng LINE
+            TypedValue[] filterValues = new TypedValue[]
+            {
+                new TypedValue((int)DxfCode.Start, "LINE")
+            };
+            SelectionFilter filter = new SelectionFilter(filterValues);
+
+            // Dùng SelectWindow để tìm line trong vùng
+            PromptSelectionResult selRes = ed.SelectWindow(minPt, maxPt, filter);
+            if (selRes.Status != PromptStatus.OK) return null;
+
+            foreach (SelectedObject selObj in selRes.Value)
+            {
+                if (selObj == null) continue;
+
+                Entity ent = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+                if (ent is Line line)
+                {
+                    // Kiểm tra layer không phải Continuous (nét vẽ)
+                    if (line.ColorIndex == 4) // 4=Cyan
+                    {
+                        // Tính khoảng cách từ Text đến đoạn thẳng
+                        Point3d textPos = text.Position;
+                        Point3d closestPt = line.GetClosestPointTo(textPos, false);
+                        double dist = textPos.DistanceTo(closestPt);
+
+                        if (dist < minDistance)
+                        {
+                            minDistance = dist;
+                            closestLine = line;
+                        }
+                    }
+                }
+            }
+
+            return closestLine;
+        }
+
+        //ham noi suy ra kich thuoc co dan
+        public static double TimKhoangCogian(double atsumi, double angle, string plusMinus)
+        {
+            table2_3Soto = new Dictionary<double, double>
+            {
+                {90, -4.24}, {92.5, -4.24}, {95, -3.7}, {97.5, -3.7}, {100, -3.21},
+                {102.5, -3.21}, {105, -2.8}, {107.5, -2.6}, {110, -2.43}, {112.5, -2.43},
+                {115, -2.11}, {117.5, -1.97}, {120, -1.82}, {122.5, -1.82}, {125, -1.57},
+                {127.5, -1.57}, {130, -1.34}
+            };
+            table2_3Uchi = new Dictionary<double, double>
+            {
+                {90, 0.36}, {92.5, 0.36}, {95, 0.6}, {97.5, 0.6}, {100, 0.6},
+                {102.5, 0.7}, {105, 0.7}, {107.5, 0.7}, {110, 0.7}, {112.5, 0.7},
+                {115, 0.7}, {117.5, 0.87}, {120, 0.87}, {122.5, 0.87}, {125, 0.87},
+                {127.5, 0.87}, {130, 0.87}
+            };
+
+            table3_2Soto = new Dictionary<double, double>
+            {
+                {90, -5.7}, {92.5, -5.36}, {95, -5.04}, {97.5, -4.74}, {100, -4.46},
+                {102.5, -4.2}, {105, -3.95}, {107.5, -3.71}, {110, -3.49}, {112.5, -3.28},
+                {115, -3.08}, {117.5, -2.89}, {120, -2.71}, {122.5, -2.54}, {125, -2.38},
+                {127.5, -2.22}, {130, -2.07}, {132.5, -1.92}, {135, -1.78}, {137.5, -1.65},
+                {140, -1.52}, {142.5, -1.4}, {145, -1.28}, {147.5, -1.16}, {150, -1.05},
+                {152.5, -0.95}, {155, -0.84}, {157.5, -0.75}, {160, -0.65}, {162.5, -0.56},
+                {165, -0.47}, {167.5, -0.38}, {170, -0.3}, {172.5, -0.22}, {175, -0.14}, {177.5, -0.07}
+            };
+            table3_2Uchi = new Dictionary<double, double>
+            {
+                {90, 0.7}, {92.5, 0.76}, {95, 0.82}, {97.5, 0.86}, {100, 0.9},
+                {102.5, 0.92}, {105, 0.95}, {107.5, 0.97}, {110, 0.99}, {112.5, 0.98},
+                {115, 0.98}, {117.5, 0.99}, {120, 0.97}, {122.5, 0.96}, {125, 0.94},
+                {127.5, 0.92}, {130, 0.91}, {132.5, 0.88}, {135, 0.86}, {137.5, 0.83},
+                {140, 0.8}, {142.5, 0.76}, {145, 0.72}, {147.5, 0.7}, {150, 0.65},
+                {152.5, 0.61}, {155, 0.56}, {157.5, 0.51}, {160, 0.47}, {162.5, 0.42},
+                {165, 0.37}, {167.5, 0.32}, {170, 0.24}, {172.5, 0.18}, {175, 0.12}, {177.5, 0.05}
+            };
+
+            table4_5Soto = new Dictionary<double, double>
+            {
+                {90, -8}, {92.5, -7.89}, {95, -7.43}, {97.5, -7}, {100, -6.59},
+                {102.5, -6.2}, {105, -5.84}, {107.5, -5.5}, {110, -5.18}, {112.5, -4.88},
+                {115, -4.59}, {117.5, -4.31}, {120, -4.05}, {122.5, -3.8}, {125, -3.57},
+                {127.5, -3.34}, {130, -3.12}, {132.5, -2.92}, {135, -2.72}, {137.5, -2.53},
+                {140, -2.35}, {142.5, -2.17}, {145, -2}, {147.5, -1.84}, {150, -1.68},
+                {152.5, -1.53}, {155, -1.39}, {157.5, -1.25}, {160, -1.11}, {162.5, -0.98},
+                {165, -0.86}, {167.5, -0.74}, {170, -0.62}, {172.5, -0.51}, {175, -0.4}, {177.5, -0.3}
+            };
+            table4_5Uchi = new Dictionary<double, double>
+            {
+                {90, 0.93}, {92.5, 1}, {95, 1.09}, {97.5, 1.16}, {100, 1.21},
+                {102.5, 1.26}, {105, 1.29}, {107.5, 1.3}, {110, 1.34}, {112.5, 1.34},
+                {115, 1.34}, {117.5, 1.35}, {120, 1.32}, {122.5, 1.31}, {125, 1.3},
+                {127.5, 1.27}, {130, 1.24}, {132.5, 1.23}, {135, 1.19}, {137.5, 1.14},
+                {140, 1.1}, {142.5, 1.06}, {145, 1.01}, {147.5, 0.97}, {150, 0.91},
+                {152.5, 0.86}, {155, 0.78}, {157.5, 0.72}, {160, 0.66}, {162.5, 0.59},
+                {165, 0.52}, {167.5, 0.44}, {170, 0.35}, {172.5, 0.27}, {175, 0.18}, {177.5, 0.08}
+            };
+
+            table6Soto = new Dictionary<double, double>
+            {
+                {90, -9.8}, {92.5, -9.25}, {95, -8.74}, {97.5, -8.26}, {100, -7.81},
+                {102.5, -7.37}, {105, -6.96}, {107.5, -6.58}, {110, -6.22}, {112.5, -5.87},
+                {115, -5.54}, {117.5, -5.23}, {120, -4.92}, {122.5, -4.64}, {125, -4.36},
+                {127.5, -4.09}, {130, -3.84}, {132.5, -3.6}, {135, -3.36}, {137.5, -3.13},
+                {140, -2.92}, {142.5, -2.7}, {145, -2.5}, {147.5, -2.3}, {150, -2.11},
+                {152.5, -1.93}, {155, -1.75}, {157.5, -1.57}, {160, -1.41}, {162.5, -1.24},
+                {165, -1.08}, {167.5, -0.93}, {170, -0.78}, {172.5, -0.64}, {175, -0.49}, {177.5, -0.36}
+            };
+            table6Uchi = new Dictionary<double, double>
+            {
+                {90, 2.15}, {92.5, 2.23}, {95, 2.57}, {97.5, 2.56}, {100, 2.56},
+                {102.5, 2.54}, {105, 2.51}, {107.5, 2.47}, {110, 2.45}, {112.5, 2.39},
+                {115, 2.34}, {117.5, 2.29}, {120, 2.23}, {122.5, 2.18}, {125, 2.11},
+                {127.5, 2.03}, {130, 1.96}, {132.5, 1.9}, {135, 1.82}, {137.5, 1.74},
+                {140, 1.66}, {142.5, 1.57}, {145, 1.5}, {147.5, 1.4}, {150, 1.31},
+                {152.5, 1.21}, {155, 1.13}, {157.5, 1.03}, {160, 0.92}, {162.5, 0.82},
+                {165, 0.7}, {167.5, 0.59}, {170, 0.48}, {172.5, 0.37}, {175, 0.25}, {177.5, 0.13}
+            };
+
+            Dictionary<double, double> table = null;
+            //chia cac truong hop de tim khoang co dan
+            if (atsumi == 9)
+            {
+                if (angle == 90 && plusMinus == "plus")//uchi
+                {
+                    return 1.5;
+                }
+                else if (angle == 90 && plusMinus == "minus")//soto
+                {
+                    return -18;
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+            else if (atsumi == 1.6)
+            {
+                if (angle == 90 && plusMinus == "minus")//soto
+                {
+                    return -3.5;
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+            else if (atsumi == 2.3 || atsumi==3.2 ||atsumi==4.5 || atsumi==6)
+            {
+                if (atsumi == 2.3)
+                    table = (plusMinus == "plus") ? table2_3Uchi : table2_3Soto;
+                else if (atsumi == 3.2)
+                    table = (plusMinus == "plus") ? table3_2Uchi : table3_2Soto;
+                else if (atsumi == 4.5)
+                    table = (plusMinus == "plus") ? table4_5Uchi : table4_5Soto;
+                else if (atsumi == 6)
+                    table = (plusMinus == "plus") ? table6Uchi : table6Soto;
+                else 
+                {
+                    table = null;
+                }
+
+                if (table != null && table.Count > 0)
+                {
+                    // tìm giá trị gần angle nhất
+                    double nearestKey = table.Keys.OrderBy(k => Math.Abs(k - angle)).First();
+                    return table[nearestKey];
+                }
+                else
+                {
+                    return 0;
+                }
+            }
+            else// truong hop bi loi
+            {
+                return 0;
+            }
+        }
+
+        //ve line tu 2 point
+        public static void CreateLine(Database db, Transaction tr, Point3d pt1, Point3d pt2)
+        {
+            // Tạo đối tượng line
+            Line line = new Line(pt1, pt2);
+            line.ColorIndex = 2;//yellow
+
+            // Lấy BlockTable và BlockTableRecord (ModelSpace)
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            // Thêm line vào bản vẽ
+            btr.AppendEntity(line);
+            tr.AddNewlyCreatedDBObject(line, true);
+        }
+
+        //tinh khoang cach vuong goc tu 1 diem toi 1 line
+        public static double DistancePerpendicularToLine(Point3d pt, Point3d lineStart, Point3d lineEnd)
+        {
+            Vector3d dir = (lineEnd - lineStart).GetNormal(); // vector chỉ phương của line
+            Vector3d v = pt - lineStart; // vector từ điểm đến lineStart
+            Vector3d proj = v - (v.DotProduct(dir)) * dir; // vector vuông góc (v - phần chiếu)
+            return proj.Length;
+        }
+
+        //dim khoang cach 2 diem
+        public static void CreateDim(Database db, Transaction tr, Point3d pt1, Point3d pt2, string overrideText,double distance)
+        {
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            // Tính điểm đặt đường dim (dời 10 đơn vị vuông góc)
+            Vector3d dimDir = (pt2 - pt1).GetNormal();
+            Vector3d perpDir = dimDir.RotateBy(Math.PI / 2, Vector3d.ZAxis); // Vuông góc
+            Point3d dimLinePoint = pt1 + perpDir.MultiplyBy(distance); // Dời lên 10 đơn vị
+
+            // Tạo dim
+            AlignedDimension dim = new AlignedDimension(pt1, pt2, dimLinePoint, overrideText, db.Dimstyle);
+            //dim.ColorIndex = 2; // Màu vàng
+            //dim.Layer = "Dimensions"; // Tuỳ chọn layer
+
+            btr.AppendEntity(dim);
+            tr.AddNewlyCreatedDBObject(dim, true);
+        }
+
+        //dim phuong X
+        public void CreateDimensionX(Database db, Transaction tr,  Point3d p1, Point3d p2, double offset, string overrideText = "")
+        {
+            // Set dimstyle mặc định
+            DimStyleTable dimTable = tr.GetObject(db.DimStyleTableId, OpenMode.ForRead) as DimStyleTable;
+            if (dimTable.Has("DIMSTYEX_2"))
+            {
+                ObjectId dimStyleId = dimTable["DIMSTYEX_2"];
+                DimStyleTableRecord dimStyleRec = tr.GetObject(dimStyleId, OpenMode.ForRead) as DimStyleTableRecord;
+
+                db.Dimstyle = dimStyleId;
+                db.SetDimstyleData(dimStyleRec);
+            }
+
+            // Tính điểm ghi kích thước (trên phương Y, offset lên)
+            Point3d dimLinePoint = new Point3d((p1.X + p2.X) / 2, Math.Min(p1.Y, p2.Y) + offset, 0);
+
+            // Tạo đối tượng RotatedDimension
+            RotatedDimension dim = new RotatedDimension
+            {
+                Rotation = 0, // Phương X
+                XLine1Point = p1,
+                XLine2Point = p2,
+                DimLinePoint = dimLinePoint,
+                DimensionStyle = db.Dimstyle
+            };
+
+            // Nếu có override text, gán vào
+            if (!string.IsNullOrWhiteSpace(overrideText))
+            {
+                dim.DimensionText = overrideText;
+            }
+
+            // Ghi vào model space
+            BlockTable bt = tr.GetObject(db.BlockTableId, OpenMode.ForRead) as BlockTable;
+            BlockTableRecord model = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+            model.AppendEntity(dim);
+            tr.AddNewlyCreatedDBObject(dim, true);
+        }
+
+        //dim phuong Y
+        public void CreateDimensionY(Database db, Transaction tr, Point3d p1, Point3d p2, double offset, string overrideText = "")
+        {
+            // Set dimstyle mặc định
+            DimStyleTable dimTable = tr.GetObject(db.DimStyleTableId, OpenMode.ForRead) as DimStyleTable;
+            if (dimTable.Has("DIMSTYEX_2"))
+            {
+                ObjectId dimStyleId = dimTable["DIMSTYEX_2"];
+                DimStyleTableRecord dimStyleRec = tr.GetObject(dimStyleId, OpenMode.ForRead) as DimStyleTableRecord;
+
+                db.Dimstyle = dimStyleId;
+                db.SetDimstyleData(dimStyleRec);
+            }
+
+            // Tính điểm ghi kích thước (trên phương X, offset sang trái)
+            Point3d dimLinePoint = new Point3d(Math.Min(p1.X, p2.X) + offset, (p1.Y + p2.Y) / 2, 0);
+
+            // Tạo đối tượng RotatedDimension
+            RotatedDimension dim = new RotatedDimension
+            {
+                Rotation = Math.PI/2, // Phương Y
+                XLine1Point = p1,
+                XLine2Point = p2,
+                DimLinePoint = dimLinePoint,
+                DimensionStyle = db.Dimstyle
+            };
+
+            // Nếu có override text, gán vào
+            if (!string.IsNullOrWhiteSpace(overrideText))
+            {
+                dim.DimensionText = overrideText;
+            }
+
+            // Ghi vào model space
+            BlockTable bt = tr.GetObject(db.BlockTableId, OpenMode.ForRead) as BlockTable;
+            BlockTableRecord model = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+            model.AppendEntity(dim);
+            tr.AddNewlyCreatedDBObject(dim, true);
+        }
+
+        //ve duong leader
+        public static void CreateLeaderNoText(Database db, Transaction tr, Point3d p0, Point3d p1, Point3d p2)
+        {
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            // Khởi tạo Leader
+            Leader leader = new Leader();
+            leader.SetDatabaseDefaults();
+            leader.Annotative = AnnotativeStates.False;
+            leader.HasArrowHead = true;
+            leader.Dimasz = 2; // Kích thước mũi tên
+            leader.ColorIndex = 7;//white
+
+            // Gán các điểm leader (từ mũi tên tới đầu)
+            leader.AppendVertex(p0); // điểm mũi tên
+            leader.AppendVertex(p1);
+            leader.AppendVertex(p2);
+
+            btr.AppendEntity(leader);
+            tr.AddNewlyCreatedDBObject(leader, true);
+        }
+
+        //create MText
+        public static void CreateMText(Database db, Transaction tr, Point3d insertPoint, string text)
+        {
+            // Truy cập BlockTable và BlockTableRecord
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+            // Tạo MText
+            MText mText = new MText();
+            mText.SetDatabaseDefaults();
+
+            mText.Contents = text;
+            mText.Location = insertPoint;
+            mText.TextHeight = 60; // Chiều cao chữ
+            mText.Attachment = AttachmentPoint.BottomLeft; // Căn trái dưới
+            mText.Rotation = 0;
+            mText.ColorIndex = 3; // Xanh lá
+
+            // Thêm vào bản vẽ
+            btr.AppendEntity(mText);
+            tr.AddNewlyCreatedDBObject(mText, true);
+        }
+
+        //kiem tra phuong cua mage line
+        public static string GetLineOrientation(Line line, double angleTolerance = 0.01)
+        {
+            if (line == null) return "Invalid";
+
+            Vector3d dir = line.EndPoint - line.StartPoint;
+            double angle = Math.Atan2(dir.Y, dir.X); // tính góc so với trục X
+
+            // Chuẩn hóa góc về 0 -> PI
+            angle = Math.Abs(angle % Math.PI);
+
+            // Tính độ lệch so với các hướng chuẩn
+            double deltaToHorizontal = Math.Min(Math.Abs(angle), Math.Abs(Math.PI - angle));
+            double deltaToVertical = Math.Abs(angle - Math.PI / 2);
+
+            return deltaToHorizontal < deltaToVertical ? "Horizontal" : "Vertical";
+        }
+
+
+
+
+
+        #endregion
+    }
+}
