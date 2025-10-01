@@ -1,0 +1,527 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.Colors;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LazerLabel.Numbering
+{
+    public class CheckCommand
+    {
+        //check open or close
+        [CommandMethod("C1_CheckJointError")]
+        public void CheckSegmentsConnectivity()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                CheckLayer(tr, db, "CheckError");
+
+                // Lọc chỉ màu xanh lá cây
+                TypedValue[] filterValues = new TypedValue[]
+                {
+                    new TypedValue((int)DxfCode.Color, 3),// chỉ màu xanh
+                    new TypedValue((int)DxfCode.LinetypeName, "Continuous") // chỉ nét liền
+                };
+                SelectionFilter filter = new SelectionFilter(filterValues);
+                PromptSelectionOptions pso = new PromptSelectionOptions()
+                {
+                    MessageForAdding = "\nチェックしたい絵を選択してください:"
+                };
+
+                PromptSelectionResult selRes = ed.GetSelection(pso, filter);
+                if (selRes.Status != PromptStatus.OK)
+                {
+                    ed.WriteMessage("\n何も選択されません!");
+                    return;
+                }
+
+                List<Point3d> endpoints = new List<Point3d>();
+
+                // Thu thập các điểm đầu/cuối
+                foreach (SelectedObject obj in selRes.Value)
+                {
+                    if (obj == null) continue;
+                    Entity ent = tr.GetObject(obj.ObjectId, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    if (ent is Line line)
+                    {
+                        endpoints.Add(line.StartPoint);
+                        endpoints.Add(line.EndPoint);
+                    }
+                    else if (ent is Arc arc)
+                    {
+                        const int arcSegments = 3;
+                        double startAngle = arc.StartAngle;
+                        double endAngle = arc.EndAngle;
+
+                        if (endAngle < startAngle)
+                            endAngle += 2 * Math.PI;
+
+                        for (int i = 0; i < arcSegments; i++)
+                        {
+                            double angle1 = startAngle + (endAngle - startAngle) * i / arcSegments;
+                            double angle2 = startAngle + (endAngle - startAngle) * (i + 1) / arcSegments;
+
+                            Point3d pt1 = arc.Center + Vector3d.XAxis.RotateBy(angle1, Vector3d.ZAxis) * arc.Radius;
+                            Point3d pt2 = arc.Center + Vector3d.XAxis.RotateBy(angle2, Vector3d.ZAxis) * arc.Radius;
+
+                            endpoints.Add(pt1);
+                            endpoints.Add(pt2);
+                        }
+                    }
+                    else if (ent is Polyline pl)
+                    {
+                        for (int i = 0; i < pl.NumberOfVertices; i++)
+                        {
+                            endpoints.Add(pl.GetPoint3dAt(i));
+                        }
+                    }
+                }
+
+                // Kiểm tra từng điểm có nối được với điểm khác không
+                double epsilon = 0.18;
+                for (int i = 0; i < endpoints.Count; i++)
+                {
+                    Point3d pt = endpoints[i];
+                    bool connected = false;
+
+                    for (int j = 0; j < endpoints.Count; j++)
+                    {
+                        if (i == j) continue;
+
+                        if (pt.DistanceTo(endpoints[j]) < epsilon)
+                        {
+                            connected = true;
+                            break;
+                        }
+                    }
+
+                    if (!connected)
+                    {
+                        DrawErrorCircle(tr, db, pt);
+                    }
+                }
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("C2_CheckIntersect")]
+        public void CheckIntersect()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            var checkErrorLayerName = "CheckError";
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                // 1) Chọn tất cả polyline thuoc layer "Polyline_Temp"
+                var filterPolys = new SelectionFilter(new TypedValue[]
+                {
+                    new TypedValue((int)DxfCode.Operator, "<AND"),
+                        new TypedValue((int)DxfCode.Operator, "<OR"),
+                            new TypedValue((int)DxfCode.Start, "LWPOLYLINE"),
+                            new TypedValue((int)DxfCode.Start, "POLYLINE"),
+                        new TypedValue((int)DxfCode.Operator, "OR>"),
+                        new TypedValue((int)DxfCode.LayerName, "Polyline_Temp"),
+                    new TypedValue((int)DxfCode.Operator, "AND>")
+                });
+
+                // Cho phép người dùng chọn polyline trực tiếp với filter
+                var pso = new PromptSelectionOptions();
+                pso.MessageForAdding = "\nチェックしたいオブジェクトを選択してください: ";
+
+                var rawSel = ed.GetSelection(pso, filterPolys);
+                if (rawSel.Status != PromptStatus.OK)
+                {
+                    ed.WriteMessage("\nポリラインが選択されませんでした。");
+                    return;
+                }
+
+                var polyIds = new List<ObjectId>(rawSel.Value.GetObjectIds());
+
+                if (polyIds.Count == 0)
+                {
+                    return;
+                }
+
+                // 2) Duyệt từng polyline
+                foreach (var plId in polyIds)
+                {
+                    var ent = tr.GetObject(plId, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    Extents3d ext;// Lấy extents
+                    try
+                    {
+                        ext = ent.GeometricExtents;
+                    }
+                    catch
+                    {
+                        // Một số entity chưa tính được extents khi không regen, bỏ qua
+                        continue;
+                    }
+
+                    var min = ext.MinPoint;
+                    var max = ext.MaxPoint;
+
+                    // Quét crossing-window trong phạm vi min..max với filter:
+                    // chỉ lấy LINE/ARC/LWPOLYLINE/POLYLINE và Color=3 (xanh)
+                    var filterGreenCurves = new SelectionFilter(new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Operator, "<AND"),
+                            new TypedValue((int)DxfCode.Operator, "<OR"),
+                                new TypedValue((int)DxfCode.Start, "LINE"),
+                                new TypedValue((int)DxfCode.Start, "ARC"),
+                                new TypedValue((int)DxfCode.Start, "CIRCLE"),
+                                new TypedValue((int)DxfCode.Start, "LWPOLYLINE"),
+                                new TypedValue((int)DxfCode.Start, "POLYLINE"),
+                            new TypedValue((int)DxfCode.Operator, "OR>"),
+                            new TypedValue((int)DxfCode.Color, 3), // ACI=3: Green
+                        new TypedValue((int)DxfCode.Operator, "AND>")
+                    });
+
+                    var psr = ed.SelectCrossingWindow(min, max, filterGreenCurves);
+                    if (psr.Status != PromptStatus.OK || psr.Value.Count == 0)
+                        continue;
+
+                    var candidateIds = new List<ObjectId>(psr.Value.GetObjectIds());
+
+                    // 3) Kiểm tra giao điểm "nội bộ" (không phải tại điểm đầu/cuối của chính nó)
+                    MarkInternalIntersections(db, tr, candidateIds, checkErrorLayerName);
+                }
+
+                tr.Commit();
+            }
+        }
+
+        [CommandMethod("C3_CheckHasText")]
+        public void CheckHasText()
+         {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database db = doc.Database;
+            Editor ed = doc.Editor;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                #region loc lay cac polyline
+                // 1) Chọn tất cả polyline thuoc layer "Polyline_Temp"
+                var filterPolys = new SelectionFilter(new TypedValue[]
+                {
+                    new TypedValue((int)DxfCode.Operator, "<AND"),
+                        new TypedValue((int)DxfCode.Operator, "<OR"),
+                            new TypedValue((int)DxfCode.Start, "LWPOLYLINE"),
+                            new TypedValue((int)DxfCode.Start, "POLYLINE"),
+                        new TypedValue((int)DxfCode.Operator, "OR>"),
+                        new TypedValue((int)DxfCode.LayerName, "Polyline_Temp"),
+                    new TypedValue((int)DxfCode.Operator, "AND>")
+                });
+
+                // Cho phép người dùng chọn polyline trực tiếp với filter
+                var pso = new PromptSelectionOptions();
+                pso.MessageForAdding = "\nチェックしたいオブジェクトを選択してください: ";
+
+                var rawSel = ed.GetSelection(pso, filterPolys);
+                if (rawSel.Status != PromptStatus.OK)
+                {
+                    ed.WriteMessage("\nポリラインが選択されませんでした。");
+                    return;
+                }
+
+                var polyIds = new List<ObjectId>(rawSel.Value.GetObjectIds());
+
+                if (polyIds.Count == 0)
+                {
+                    return;
+                }
+                #endregion
+
+                // 2) Duyệt từng polyline
+                foreach (var plId in polyIds)
+                {
+                    var ent = tr.GetObject(plId, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+
+                    Extents3d ext;// Lấy extents
+                    try
+                    {
+                        ext = ent.GeometricExtents;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    var min = ext.MinPoint;
+                    var max = ext.MaxPoint;
+
+                    // Quét crossing-window trong phạm vi min..max với filter:
+                    TypedValue[] filterValues = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "TEXT")
+                    };
+                    SelectionFilter filter = new SelectionFilter(filterValues);
+
+                    bool hasValidText = false;
+                    var psr = ed.SelectCrossingWindow(min, max, filter);
+
+                    foreach (SelectedObject sel in psr.Value)
+                    {
+                        if (sel == null) continue;
+
+                        var textEnt = tr.GetObject(sel.ObjectId, OpenMode.ForRead) as DBText;
+                        if (textEnt == null) continue;
+
+                        string txt = textEnt.TextString.Trim();
+
+                        int slashIndex = txt.IndexOf('/');
+                        if (slashIndex >= 0 && slashIndex < txt.Length - 1)
+                        {
+                            char nextChar = txt[slashIndex + 1];
+                            if (char.IsDigit(nextChar))
+                            {
+                                hasValidText = true;
+                                break; // Chỉ cần 1 text hợp lệ là đủ
+                            }
+                        }
+                    }
+
+                    // Nếu không có text hợp lệ thì vẽ vòng tròn lỗi
+                    if (!hasValidText)
+                    {
+                        Point3d centerPt = new Point3d((ext.MinPoint.X + ext.MaxPoint.X) / 2,(ext.MinPoint.Y + ext.MaxPoint.Y) / 2,0);
+                        DrawErrorCircleBig(tr, db, centerPt);
+                    }
+                }
+                tr.Commit();
+            }
+        }
+
+
+        #region ham dung chung
+        //ve duong tron canh bao
+        private static void DrawErrorCircle(Transaction tr, Database db, Point3d center)
+        {
+            Circle circle = new Circle(center, Vector3d.ZAxis, 20); // 20mm
+            circle.Layer = "CheckError";
+            circle.Color = Color.FromColorIndex(ColorMethod.ByAci, 2); // Vàng
+
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
+            btr.AppendEntity(circle);
+            tr.AddNewlyCreatedDBObject(circle, true);
+        }
+
+        //ve duong tron canh bao R150
+        private static void DrawErrorCircleBig(Transaction tr, Database db, Point3d center)
+        {
+            Circle circle = new Circle(center, Vector3d.ZAxis, 150); // 150mm
+            circle.Layer = "CheckError";
+            circle.Color = Color.FromColorIndex(ColorMethod.ByAci, 2); // Vàng
+
+            BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
+            btr.AppendEntity(circle);
+            tr.AddNewlyCreatedDBObject(circle, true);
+        }
+
+        //kiem tra layer xem co ton tai khong, neu khong thi tao layer moi
+        public static void CheckLayer(Transaction tr, Database db, string layName)
+        {
+            LayerTable layTb = tr.GetObject(db.LayerTableId, OpenMode.ForRead) as LayerTable;
+            if (!layTb.Has(layName))
+            {
+                layTb.UpgradeOpen();
+                LayerTableRecord layTbRec = new LayerTableRecord
+                {
+                    Name = layName,
+                    Color = Color.FromColorIndex(ColorMethod.ByAci, 10)
+                };
+                layTb.Add(layTbRec);
+                tr.AddNewlyCreatedDBObject(layTbRec, true);
+            }
+        }
+
+        //kiem tra va doi mau nhung doi tuong co giao cat
+        private void MarkInternalIntersectionsXXX(Database db, Transaction tr, List<ObjectId> ids, string checkErrorLayer)//khong dung
+        {
+            var tol = new Tolerance(1e-3, 1e-3);
+
+            // Chuẩn bị mở để ghi khi cần
+            // Duyệt từng đối tượng A
+            for (int i = 0; i < ids.Count; i++)
+            {
+                var entA = tr.GetObject(ids[i], OpenMode.ForRead) as Entity;
+                if (entA == null) continue;
+
+                // Chỉ xét các loại curve
+                var curveA = entA as Curve;
+                if (curveA == null) continue;
+
+                // Lấy điểm đầu/cuối của A (đối với closed polyline, Start==End)
+                Point3d aStart, aEnd;
+                try
+                {
+                    aStart = curveA.StartPoint;
+                    aEnd = curveA.EndPoint;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                bool hasInternalHit = false;
+
+                for (int j = 0; j < ids.Count && !hasInternalHit; j++)
+                {
+                    if (i == j) continue;
+
+                    var entB = tr.GetObject(ids[j], OpenMode.ForRead) as Entity;
+                    if (entB == null) continue;
+
+                    var curveB = entB as Curve;
+                    if (curveB == null) continue;
+
+                    // Tính giao điểm
+                    var pts = new Point3dCollection();
+                    try
+                    {
+                        curveA.IntersectWith(curveB, Intersect.OnBothOperands, pts, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (pts.Count == 0) continue;
+
+                    // Kiểm tra từng giao điểm có trùng endpoint của A hay không
+                    Point3d midpoint;
+                    try
+                    {
+                        double length = curveA.GetDistanceAtParameter(curveA.EndParam);
+                        double halfLength = length / 2;
+                        double paramAtHalf = curveA.GetParameterAtDistance(halfLength);
+                        midpoint = curveA.GetPointAtParameter(paramAtHalf);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    double distToA = curveA.GetClosestPointTo(midpoint, false).DistanceTo(midpoint);
+                    bool midpointNotOnSelf = distToA > 1e-3;
+
+                    foreach (Point3d p in pts)
+                    {
+                        bool isAtStart = p.IsEqualTo(aStart, tol);
+                        bool isAtEnd = p.IsEqualTo(aEnd, tol);
+
+                        if (!(isAtStart || isAtEnd) && midpointNotOnSelf)
+                        {
+                            hasInternalHit = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (hasInternalHit)
+                {
+                    // Đổi layer của A thành "CheckError"
+                    entA.UpgradeOpen();
+                    entA.Layer = checkErrorLayer;
+                    entA.ColorIndex = 2;//mau vang
+                }
+            }
+        }
+        private void MarkInternalIntersections(Database db, Transaction tr, List<ObjectId> ids, string checkErrorLayer)
+        {
+            var tol = new Tolerance(1e-3, 1e-3);
+
+            // Chuẩn bị mở để ghi khi cần
+            // Duyệt từng đối tượng A
+            for (int i = 0; i < ids.Count; i++)
+            {
+                var entA = tr.GetObject(ids[i], OpenMode.ForRead) as Entity;
+                if (entA == null) continue;
+
+                // Chỉ xét các loại curve
+                var curveA = entA as Curve;
+                if (curveA == null) continue;
+
+                // Lấy điểm đầu/cuối của A (đối với closed polyline, Start==End)
+                Point3d aStart, aEnd;
+                try
+                {
+                    aStart = curveA.StartPoint;
+                    aEnd = curveA.EndPoint;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                bool hasInternalHit = false;
+
+                for (int j = 0; j < ids.Count && !hasInternalHit; j++)
+                {
+                    if (i == j) continue;
+
+                    var entB = tr.GetObject(ids[j], OpenMode.ForRead) as Entity;
+                    if (entB == null) continue;
+
+                    var curveB = entB as Curve;
+                    if (curveB == null) continue;
+
+                    // Tính giao điểm
+                    var pts = new Point3dCollection();
+                    try
+                    {
+                        curveA.IntersectWith(curveB, Intersect.OnBothOperands, pts, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (pts.Count == 0) continue;
+
+                    // Kiểm tra từng giao điểm có trùng endpoint của A hay không
+                    foreach (Point3d p in pts)
+                    {
+                        bool isAtStart = p.IsEqualTo(aStart, tol);
+                        bool isAtEnd = p.IsEqualTo(aEnd, tol);
+
+                        // Nếu KHÔNG nằm ở endpoint của A => là giao điểm "nội bộ" của A
+                        if (!(isAtStart || isAtEnd))
+                        {
+                            hasInternalHit = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (hasInternalHit)
+                {
+                    // Đổi layer của A thành "CheckError"
+                    entA.UpgradeOpen();
+                    entA.Layer = checkErrorLayer;
+                    entA.ColorIndex = 2;//mau vang
+                }
+            }
+        }
+        #endregion
+    }
+}
