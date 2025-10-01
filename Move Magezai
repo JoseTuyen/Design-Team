@@ -1,0 +1,146 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Teigha.ApplicationServices;
+using Teigha.DatabaseServices;
+using Teigha.EditorInput;
+using Teigha.Geometry;
+using Teigha.Runtime;
+
+namespace LazerLabel.Mage
+{
+    public class MoveMageZai
+    {
+        [CommandMethod("M1_MoveMage")]
+        public void MageMove()
+        {
+            Document doc = Application.DocumentManager.MdiActiveDocument;
+            Database dat = doc.Database;
+            Editor ed = doc.Editor;
+
+            string layName = "Polyline_Temp";
+            PromptSelectionResult promSeRes;
+            List<Polyline> polyList = new List<Polyline>();
+
+            using (Transaction tr = dat.TransactionManager.StartTransaction())
+            {
+                BlockTable blTb = tr.GetObject(dat.BlockTableId, OpenMode.ForRead) as BlockTable;
+                BlockTableRecord blTbRec = tr.GetObject(blTb[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                #region tao bo loc
+                TypedValue[] typeValArr = new TypedValue[]
+                {
+                    new TypedValue((int)DxfCode.Start, "LWPOLYLINE,POLYLINE")
+                };
+
+                //tao bo loc
+                SelectionFilter selectFil = new SelectionFilter(typeValArr);
+                #endregion
+
+                #region lay cac polyline
+                promSeRes = doc.Editor.GetSelection(selectFil);
+
+                foreach (SelectedObject selObj in promSeRes.Value)
+                {
+                    Entity ent = tr.GetObject(selObj.ObjectId, OpenMode.ForRead) as Entity;
+
+                    if (ent is Polyline pl && pl.Layer == layName)
+                    {
+                        polyList.Add(pl);
+                    }
+                }
+                #endregion
+
+                #region xac dinh be rong pham vi polyline mau do
+                double minX = double.MaxValue;
+                double maxX = double.MinValue;
+                foreach (Polyline pl in polyList)
+                {
+                    Extents3d ext = pl.GeometricExtents;
+                    minX = Math.Min(minX, ext.MinPoint.X);
+                    maxX = Math.Max(maxX, ext.MaxPoint.X);
+                }
+                double width = maxX - minX;
+                Vector3d moveVec = new Vector3d(width + 3000, 0, 0);
+                #endregion
+
+                #region Xử lý từng polyline
+                foreach (Polyline pl in polyList)
+                {
+                    bool containsKeyword = false;
+                    Extents3d ext = pl.GeometricExtents;
+
+                    // Xét tất cả MText xem có chua ki tu can di chuyen
+                    foreach (ObjectId objId in blTbRec)
+                    {
+                        if (objId.ObjectClass.DxfName == "TEXT")
+                        {
+                            DBText text = tr.GetObject(objId, OpenMode.ForRead) as DBText;
+                            if (text != null)
+                            {
+                                // Kiểm tra vị trí text nằm trong extents polyline
+                                if (ext.MinPoint.X - 20 <= text.Position.X && text.Position.X <= ext.MaxPoint.X + 20 &&
+                                    ext.MinPoint.Y - 20 <= text.Position.Y && text.Position.Y <= ext.MaxPoint.Y + 20)
+                                {
+                                    if (text.TextString.Contains("M"))
+                                    {
+                                        containsKeyword = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!containsKeyword)
+                        continue;
+
+                    // Tạo vùng mở rộng 20mm mỗi hướng
+                    double delta = 20.0;
+                    Point3d winMin = new Point3d(ext.MinPoint.X - delta, ext.MinPoint.Y - delta, 0);
+                    Point3d winMax = new Point3d(ext.MaxPoint.X + delta, ext.MaxPoint.Y + delta, 0);
+
+                    TypedValue[] filter = new TypedValue[]
+                    {
+                        new TypedValue((int)DxfCode.Start, "*") // Lấy tất cả đối tượng (trừ Dimension thì lọc sau)
+                    };
+
+                    SelectionFilter selFilter = new SelectionFilter(filter);
+                    PromptSelectionResult selRes = ed.SelectWindow(winMin, winMax, selFilter);
+
+                    if (selRes.Status != PromptStatus.OK) return;
+
+                    SelectionSet selSet = selRes.Value;
+
+                    foreach (ObjectId objId in selSet.GetObjectIds())
+                    {
+                        Entity ent = tr.GetObject(objId, OpenMode.ForRead) as Entity;
+                        if (ent == null || ent is Dimension) continue;
+
+                        // Copy & move như cũ
+                        try
+                        {
+                            Entity copiedEnt = ent.Clone() as Entity;
+                            if (copiedEnt != null)
+                            {
+                                copiedEnt.TransformBy(Matrix3d.Displacement(moveVec));
+                                blTbRec.AppendEntity(copiedEnt);
+                                tr.AddNewlyCreatedDBObject(copiedEnt, true);
+                            }
+                        }
+                        catch
+                        {
+                            // Bỏ qua nếu có lỗi
+                        }
+                    }
+
+                }
+                #endregion
+
+                tr.Commit();
+            }
+        }
+    }
+}
